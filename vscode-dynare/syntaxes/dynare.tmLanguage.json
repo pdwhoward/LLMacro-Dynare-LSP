@@ -1,0 +1,136 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Dynare",
+  "scopeName": "source.dynare",
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#macros" },
+    { "include": "#blocks" },
+    { "include": "#keywords" },
+    { "include": "#equation-names" },
+    { "include": "#numbers" },
+    { "include": "#operators" },
+    { "include": "#strings" },
+    { "include": "#functions" },
+    { "include": "#variables" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.block.dynare",
+          "begin": "/\\*",
+          "end": "\\*/"
+        },
+        {
+          "name": "comment.line.double-slash.dynare",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.line.percent.dynare",
+          "match": "%.*$"
+        }
+      ]
+    },
+    "macros": {
+      "patterns": [
+        {
+          "name": "meta.preprocessor.dynare",
+          "match": "@#.*$"
+        }
+      ]
+    },
+    "blocks": {
+      "patterns": [
+        {
+          "name": "keyword.control.block.dynare",
+          "match": "\\b(model|initval|endval|shocks|steady_state_model|estimated_params|verbatim)\\b"
+        },
+        {
+          "name": "keyword.control.end.dynare",
+          "match": "\\bend\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.declaration.dynare",
+          "match": "\\b(var|varexo|varexo_det|parameters|predetermined_variables|trend_var|model_local_variable)\\b"
+        },
+        {
+          "name": "keyword.command.dynare",
+          "match": "\\b(steady|check|resid|stoch_simul|estimation|simul|perfect_foresight_setup|perfect_foresight_solver|forecast|osr|ramsey_model|ramsey_policy|discretionary_policy|planner_objective|write_latex_dynamic_model|write_latex_static_model|shock_decomposition|identification|sensitivity|varobs|calib_smoother)\\b"
+        },
+        {
+          "name": "keyword.option.dynare",
+          "match": "\\b(linear|order|irf|periods|hp_filter|nograph|noprint|nomoments|loglinear|simul_replic|ar|nocorr|irf_plot_threshold)\\b"
+        },
+        {
+          "name": "keyword.distribution.dynare",
+          "match": "\\b(BETA_PDF|GAMMA_PDF|NORMAL_PDF|INV_GAMMA_PDF|UNIFORM_PDF|INV_GAMMA1_PDF|INV_GAMMA2_PDF)\\b"
+        }
+      ]
+    },
+    "equation-names": {
+      "patterns": [
+        {
+          "name": "entity.name.tag.equation.dynare",
+          "begin": "\\[\\s*name\\s*=\\s*'",
+          "end": "'\\s*\\]"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.dynare",
+          "match": "\\b[0-9]+(\\.[0-9]+)?([eE][+-]?[0-9]+)?\\b"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.dynare",
+          "match": "[+\\-*/\\^=<>]"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.single.dynare",
+          "begin": "'",
+          "end": "'"
+        },
+        {
+          "name": "string.quoted.double.dynare",
+          "begin": "\"",
+          "end": "\""
+        },
+        {
+          "name": "string.latex.dynare",
+          "begin": "\\$\\{",
+          "end": "\\}\\$"
+        }
+      ]
+    },
+    "functions": {
+      "patterns": [
+        {
+          "name": "support.function.builtin.dynare",
+          "match": "\\b(exp|log|sqrt|abs|sin|cos|tan|asin|acos|atan|min|max|sign|steady_state|STEADY_STATE|normpdf|normcdf|stderr)\\b"
+        }
+      ]
+    },
+    "variables": {
+      "patterns": [
+        {
+          "name": "variable.other.dynare",
+          "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b"
+        }
+      ]
+    }
+  }
+}

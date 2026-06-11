@@ -1,0 +1,24 @@
+{
+  "name": "dynare-lsp",
+  "version": "0.3.1",
+  "description": "Dynare (.mod/.inc) language server for Claude Code (diagnostics + code intelligence).",
+  "author": {
+    "name": "LLMacro"
+  },
+  "lspServers": {
+    "dynare": {
+      "command": "python",
+      "args": ["-m", "dynare_lsp"],
+      "extensionToLanguage": {
+        ".mod": "dynare",
+        ".inc": "dynare"
+      }
+    }
+  },
+  "mcpServers": {
+    "dynare": {
+      "command": "python",
+      "args": ["-m", "dynare_lsp.mcp_server"]
+    }
+  }
+}

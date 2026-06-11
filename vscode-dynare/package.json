@@ -1,0 +1,91 @@
+{
+  "name": "dynare-lsp",
+  "displayName": "Dynare Language Support",
+  "description": "Language support for Dynare .mod files with steady state validation",
+  "version": "0.3.1",
+  "publisher": "llmacro",
+  "engines": {
+    "vscode": "^1.101.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
+  "activationEvents": [
+    "onLanguage:dynare",
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "dynare",
+        "aliases": [
+          "Dynare",
+          "dynare"
+        ],
+        "extensions": [
+          ".mod",
+          ".inc"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "dynare",
+        "scopeName": "source.dynare",
+        "path": "./syntaxes/dynare.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Dynare",
+      "properties": {
+        "dynare.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "Path to the Python interpreter that has dynare-lsp installed"
+        },
+        "dynare.steadyStateTolerance": {
+          "type": "number",
+          "default": 1e-6,
+          "description": "Tolerance for steady state equation residuals"
+        },
+        "dynare.preprocessorPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to dynare-preprocessor binary. Leave empty for auto-detection."
+        },
+        "dynare.searchPaths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Additional directories consulted by @#include resolution. Project-wide complement to per-file @#includepath directives."
+        },
+        "dynare.formatIndent": {
+          "type": ["string", "number"],
+          "default": "tab",
+          "description": "Indentation unit used by the Dynare document formatter: \"tab\", or a number of spaces (1-8)."
+        }
+      }
+    },
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "dynare.mcpServerProvider",
+        "label": "Dynare MCP"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/vscode": "1.101.0",
+    "@types/node": "^18.0.0",
+    "typescript": "^5.0.0"
+  }
+}

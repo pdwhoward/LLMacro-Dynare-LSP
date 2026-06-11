@@ -1,0 +1,14 @@
+{
+  "name": "llmacro-local",
+  "description": "Local LLMacro plugins for Claude Code (Dynare language server).",
+  "owner": {
+    "name": "LLMacro"
+  },
+  "plugins": [
+    {
+      "name": "dynare-lsp",
+      "source": "./plugins/dynare-lsp",
+      "description": "Dynare (.mod/.inc) language server for Claude Code: diagnostics, hover, and code navigation."
+    }
+  ]
+}
