@@ -11,7 +11,7 @@ the repository root in the public `LLMacro-Dynare-LSP` repo, or `dynare-lsp/`
 in the LLMacro development monorepo:
 
 ```bash
-pip install -e ".[mcp]"                       # requires Python 3.10+ for MCP
+pip install -e ".[mcp]"                       # requires Python 3.11+
 python -m dynare_lsp --check path/to/model.mod   # "No issues found" on a valid model
 ```
 
@@ -28,5 +28,13 @@ in the development monorepo:
 
 Then restart Claude Code so the language server attaches.
 
-The development monorepo's `CLAUDE_CODE_LSP_SETUP.md` has the full walkthrough
-and troubleshooting guide.
+## Troubleshooting
+
+- Run `python -c "import dynare_lsp, dynare_lsp.mcp_server"` in the same shell
+  that launches Claude Code.
+- Confirm the plugin is enabled with `/plugin` and restart Claude Code after
+  installing or updating it.
+- Confirm `.mod` and `.inc` files are recognized as Dynare files. The plugin
+  maps both extensions to the `dynare` language server.
+- If multiple Python installations are present, launch Claude Code from the
+  environment where `dynare-lsp[mcp]` is installed.

@@ -184,6 +184,14 @@ def _deadline_guarded(fn, deadline):
 # Solver-safe math environment
 # ---------------------------------------------------------------------------
 
+def _dynare_round(value: float) -> int:
+    """Round midpoint values away from zero, matching Dynare semantics."""
+    numeric = float(value)
+    if numeric >= 0:
+        return math.floor(numeric + 0.5)
+    return math.ceil(numeric - 0.5)
+
+
 def _build_solver_env(values: Dict[str, float]) -> dict:
     """Build eval environment with overflow-safe math functions.
 
@@ -247,7 +255,7 @@ def _build_solver_env(values: Dict[str, float]) -> dict:
         "atanh": math.atanh,
         "floor": math.floor,
         "ceil": math.ceil,
-        "round": round,
+        "round": _dynare_round,
         "min": min,
         "max": max,
         "erf": math.erf,
@@ -829,12 +837,16 @@ def _build_residual_function(
     param_values: Dict[str, float],
     exogenous_names: set,
     exogenous_values: Optional[Dict[str, float]] = None,
+    *,
+    penalize_invalid: bool = True,
 ) -> Callable:
     """Build the F(x) = 0 residual function from model equations.
 
     Returns a function that maps a numpy array of endogenous variable
     values to a numpy array of equation residuals.  Pre-processes all
-    equations at construction time so per-call overhead is minimal.
+    equations at construction time so per-call overhead is minimal. Solver
+    callers use finite penalties for invalid trial points; inspection callers
+    can set ``penalize_invalid=False`` to receive an evaluation error instead.
     """
     import numpy as np
     exo_values = exogenous_values or {}
@@ -912,25 +924,36 @@ def _build_residual_function(
             env[_escape_reserved(exo)] = value
 
         residuals = np.zeros(n_eqs)
+        penalty = 1e6 * (1 + np.sum(np.abs(x)))
         for i, (lhs, rhs) in enumerate(prepared_equations):
             try:
                 if rhs is not None:
                     lhs_val, err1 = _safe_eval_expr(lhs, env)
                     rhs_val, err2 = _safe_eval_expr(rhs, env)
                     if err1 or err2 or lhs_val is None or rhs_val is None:
-                        residuals[i] = 1e6 * (1 + np.sum(np.abs(x)))
+                        if not penalize_invalid:
+                            raise ValueError(err1 or err2 or "missing equation value")
+                        residuals[i] = penalty
                     elif not np.isfinite(lhs_val) or not np.isfinite(rhs_val):
-                        residuals[i] = 1e6 * (1 + np.sum(np.abs(x)))
+                        if not penalize_invalid:
+                            raise ValueError("equation produced a non-finite value")
+                        residuals[i] = penalty
                     else:
                         residuals[i] = lhs_val - rhs_val
                 else:
                     val, err = _safe_eval_expr(lhs, env)
                     if err or val is None or not np.isfinite(val):
-                        residuals[i] = 1e6 * (1 + np.sum(np.abs(x)))
+                        if not penalize_invalid:
+                            raise ValueError(err or "equation produced a non-finite value")
+                        residuals[i] = penalty
                     else:
                         residuals[i] = val
-            except Exception:
-                residuals[i] = 1e6 * (1 + np.sum(np.abs(x)))
+            except Exception as exc:
+                if not penalize_invalid:
+                    raise ValueError(
+                        f"equation {i + 1} could not be evaluated: {exc}"
+                    ) from exc
+                residuals[i] = penalty
 
         return residuals
 
@@ -1173,6 +1196,7 @@ def _gauss_seidel_improve(
     exogenous_values: Dict[str, float],
     max_sweeps: int = 15,
     tol: float = 1e-10,
+    deadline: Optional[float] = None,
 ) -> "numpy.ndarray":
     """Iteratively solve single-variable subproblems to improve initial guess.
 
@@ -1184,6 +1208,9 @@ def _gauss_seidel_improve(
     equations (u = f(C,L), etc.) quickly and also makes incremental
     progress on coupled equations.
     """
+    if _past_deadline(deadline):
+        return x0.copy()
+
     import numpy as np
 
     x = x0.copy()
@@ -1203,6 +1230,8 @@ def _gauss_seidel_improve(
     # -------------------------------------------------------------------------
 
     for sweep in range(max_sweeps):
+        if _past_deadline(deadline):
+            return x
         sweep_improved = False
 
         for eq_idx in eq_order:
@@ -1821,7 +1850,41 @@ def _jacobian_rank_issue(
             return "residual Jacobian has non-finite entries near the solution"
         jac[:, j] = (fp - fm) / (2 * h)
 
-    rank_tol = max(1e-8, tolerance * 0.1)
+    singular_values = np.linalg.svd(jac, compute_uv=False)
+    initial_scale = float(singular_values[0]) if singular_values.size else 0.0
+    stability_probe_threshold = max(1e-8, tolerance * 0.1)
+    if 0.0 < initial_scale < stability_probe_threshold:
+        # A uniformly small but stable Jacobian is still full rank. Distinguish
+        # it from cancellation noise (for example log(exp(x)) - x) by checking
+        # the finite-difference derivative at a second, larger relative step.
+        probe_jac = np.zeros_like(jac)
+        probe_eps = np.cbrt(np.finfo(float).eps)
+        for j in range(n_vars):
+            if _past_deadline(deadline):
+                return None
+            h = probe_eps * max(1.0, abs(float(x[j])))
+            xp = x.copy()
+            xm = x.copy()
+            xp[j] += h
+            xm[j] -= h
+            try:
+                fp = np.asarray(residual_fn(xp), dtype=float)
+                fm = np.asarray(residual_fn(xm), dtype=float)
+            except Exception as exc:
+                return f"could not validate residual Jacobian rank: {exc}"
+            if fp.shape != f0.shape or fm.shape != f0.shape:
+                return "residual Jacobian changed dimension near the solution"
+            if not (np.all(np.isfinite(fp)) and np.all(np.isfinite(fm))):
+                return "residual Jacobian has non-finite entries near the solution"
+            probe_jac[:, j] = (fp - fm) / (2 * h)
+
+        comparison_scale = np.maximum(np.abs(jac), np.abs(probe_jac))
+        unstable = np.abs(jac - probe_jac) > 1e-3 * comparison_scale
+        jac = np.where(unstable, 0.0, jac)
+        singular_values = np.linalg.svd(jac, compute_uv=False)
+
+    jacobian_scale = float(singular_values[0]) if singular_values.size else 0.0
+    rank_tol = jacobian_scale * max(1e-8, tolerance * 0.1)
     rank = int(np.linalg.matrix_rank(jac, tol=rank_tol))
     if rank < n_vars:
         return (
@@ -2185,7 +2248,7 @@ def compute_steady_state(
     x_gs = _gauss_seidel_improve(
         equations, locals_list, var_names, x0, eval_params,
         exogenous, exogenous_values,
-        max_sweeps=15, tol=tolerance)
+        max_sweeps=15, tol=tolerance, deadline=deadline)
 
     # Check if Gauss-Seidel already solved it
     gs_residuals = _raw_solver_residual_fn(x_gs)
@@ -2485,7 +2548,7 @@ def compute_steady_state(
         x_perturbed = _gauss_seidel_improve(
             equations, locals_list, var_names, x_perturbed,
             eval_params, exogenous, exogenous_values,
-            max_sweeps=5, tol=tolerance)
+            max_sweeps=5, tol=tolerance, deadline=deadline)
 
         result = _try_least_squares(
             solver_residual_fn, x_perturbed, tolerance, deadline=deadline)

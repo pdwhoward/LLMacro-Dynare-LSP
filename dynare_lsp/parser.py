@@ -425,6 +425,29 @@ _COMMENT_START = re.compile(
     re.MULTILINE,
 )
 
+_MACRO_CONTINUATION_RE = re.compile(
+    r"[ \t]*\\[ \t]*(?:\r\n|\n|\r)[ \t]*",
+)
+
+
+def _macro_directive_end(text: str, start: int) -> int:
+    """Return the end offset of a possibly continued macro directive."""
+    line_start = start
+    while line_start < len(text):
+        newline = re.search(r"\r\n|\n|\r", text[line_start:])
+        if newline is None:
+            return len(text)
+        line_end = line_start + newline.start()
+        if not re.search(r"\\[ \t]*$", text[line_start:line_end]):
+            return line_end
+        line_start += newline.end()
+    return len(text)
+
+
+def _collapse_macro_continuations(value: str) -> str:
+    """Join backslash-continued macro lines into one logical argument."""
+    return _MACRO_CONTINUATION_RE.sub(" ", value)
+
 
 def _strip_non_macro_comments(text: str) -> str:
     """Mask ``/* */``, ``//``, and ``%`` comments while preserving ``@#`` directives.
@@ -556,12 +579,18 @@ def _strip_comments(text: str) -> str:
                         result[j] = " "
                 i = end
             elif token in ("//", "%", "@#"):
-                # Line comment / macro directive: extends to end of line
-                end = text.find("\n", start)
+                # Macro directives can continue across physical lines with a
+                # trailing backslash; mask the complete logical directive.
+                end = (
+                    _macro_directive_end(text, start)
+                    if token == "@#"
+                    else text.find("\n", start)
+                )
                 if end == -1:
                     end = n
                 for j in range(start, end):
-                    result[j] = " "
+                    if result[j] not in "\r\n":
+                        result[j] = " "
                 i = end
             else:
                 i = m.end()
@@ -584,6 +613,9 @@ def _strip_comments(text: str) -> str:
 
 _STRING_LITERAL_STRUCTURAL = r"(?:'[^'\n]*'|\"[^\"\n]*\")"
 _NON_END_TOKEN = rf"(?:{_STRING_LITERAL_STRUCTURAL}|(?!(?<!\w)end\s*;).)"
+_OPTION_PARENS_1 = r"\([^()]*\)"
+_OPTION_PARENS_2 = rf"\((?:[^()]|{_OPTION_PARENS_1})*\)"
+_BLOCK_OPTIONS_PATTERN = rf"\((?:[^()]|{_OPTION_PARENS_2})*\)"
 
 
 def _mask_string_literals(text: str) -> str:
@@ -598,12 +630,12 @@ def _mask_string_literals(text: str) -> str:
 def _find_block(stripped: str, keyword: str) -> Optional[re.Match]:
     """Find ``keyword(...) ; … end ;`` returning a match whose group(1) is
     any options string and group(2) is the body."""
-    pattern = rf"(?<!\w){keyword}\s*(\([^)]*\))?\s*;({_NON_END_TOKEN}*?)(?<!\w)end\s*;"
+    pattern = rf"(?<!\w){keyword}\s*({_BLOCK_OPTIONS_PATTERN})?\s*;({_NON_END_TOKEN}*?)(?<!\w)end\s*;"
     return re.search(pattern, stripped, re.DOTALL | re.IGNORECASE)
 
 
 def _find_all_blocks(stripped: str, keyword: str) -> List[re.Match]:
-    pattern = rf"(?<!\w){keyword}\s*(\([^)]*\))?\s*;({_NON_END_TOKEN}*?)(?<!\w)end\s*;"
+    pattern = rf"(?<!\w){keyword}\s*({_BLOCK_OPTIONS_PATTERN})?\s*;({_NON_END_TOKEN}*?)(?<!\w)end\s*;"
     return list(re.finditer(pattern, stripped, re.DOTALL | re.IGNORECASE))
 
 
@@ -803,12 +835,12 @@ _SIMPLE_FOR_BLOCK_RE = re.compile(
     re.MULTILINE | re.DOTALL,
 )
 _FOR_BLOCK_DIRECTIVE_RE = re.compile(
-    r"^\ufeff?[ \t]*@#[ \t]*(for|endfor)\b(?:[ \t]+([^\n]*))?",
+    r"^\ufeff?[ \t]*@#[ \t]*(for|endfor)\b[ \t]*",
     re.IGNORECASE | re.MULTILINE,
 )
 _DECL_TOKEN_WITH_MACRO_RE = re.compile(
     r"(?:[A-Za-z][A-Za-z0-9_]*)?"
-    r"(?:@\{[A-Za-z_][A-Za-z0-9_]*\}[A-Za-z0-9_]*)+"
+    r"(?:@\{[^}\r\n]+\}[A-Za-z0-9_]*)+"
 )
 
 
@@ -826,14 +858,21 @@ def _simple_for_blocks(
     """Return top-level ``@#for`` blocks as offsets plus raw argument."""
     blocks: List[Tuple[int, int, int, int, str]] = []
     stack: List[Tuple[int, int, str]] = []
+    covered_until = -1
     for match in _FOR_BLOCK_DIRECTIVE_RE.finditer(text):
+        if match.start() < covered_until:
+            continue
+        directive_end = _macro_directive_end(text, match.start())
+        covered_until = directive_end
         kind = match.group(1).lower()
         if kind == "for":
-            argument = (match.group(2) or "").strip()
+            argument = _collapse_macro_continuations(
+                text[match.end() : directive_end]
+            ).strip()
             stack.append(
                 (
                     match.start(),
-                    _after_macro_directive_line(text, match.end()),
+                    _after_macro_directive_line(text, directive_end),
                     argument,
                 )
             )
@@ -846,7 +885,7 @@ def _simple_for_blocks(
         blocks.append(
             (
                 start,
-                _after_macro_directive_line(text, match.end()),
+                _after_macro_directive_line(text, directive_end),
                 body_start,
                 match.start(),
                 argument,
@@ -1468,6 +1507,12 @@ def _safe_eval(expr: str, known: Dict[str, float]) -> Optional[float]:
             return math.nan
         return NormalDist(mu, sigma).inv_cdf(p)
 
+    def _dynare_round(value: float) -> int:
+        """Match Dynare/C++ rounding: halfway values go away from zero."""
+        if value >= 0:
+            return math.floor(value + 0.5)
+        return math.ceil(value - 0.5)
+
     env = {
         "exp": math.exp,
         "log": math.log,
@@ -1494,7 +1539,7 @@ def _safe_eval(expr: str, known: Dict[str, float]) -> Optional[float]:
         "atanh": math.atanh,
         "floor": math.floor,
         "ceil": math.ceil,
-        "round": round,
+        "round": _dynare_round,
         "min": min,
         "max": max,
         "erf": math.erf,
@@ -2649,7 +2694,10 @@ def _detect_unmatched_blocks(stripped: str, text: str) -> List[Tuple]:
 
     for kw in block_keywords:
         # Find all keyword occurrences that look like block starts
-        pat = re.compile(rf"(?<!\w){kw}\s*(\([^)]*\))?\s*;", re.IGNORECASE)
+        pat = re.compile(
+            rf"(?<!\w){kw}\s*({_BLOCK_OPTIONS_PATTERN})?\s*;",
+            re.IGNORECASE,
+        )
         for m in pat.finditer(stripped):
             remaining = stripped[m.end() :]
             remaining_scan = _mask_string_literals(remaining)
@@ -2664,7 +2712,9 @@ def _detect_unmatched_blocks(stripped: str, text: str) -> List[Tuple]:
                 # not a single block, it's two openers with one closer)
                 # appears before the ``end;``.
                 other_block = re.search(
-                    r"(?<!\w)(?:" + "|".join(block_keywords) + r")\s*(\([^)]*\))?\s*;",
+                    r"(?<!\w)(?:"
+                    + "|".join(block_keywords)
+                    + rf")\s*({_BLOCK_OPTIONS_PATTERN})?\s*;",
                     remaining_scan[: end_match.start()],
                     re.IGNORECASE,
                 )
@@ -2675,7 +2725,9 @@ def _detect_unmatched_blocks(stripped: str, text: str) -> List[Tuple]:
                 # Calculate where end; should be inserted
                 # Find the next block keyword or end of file
                 next_block = re.search(
-                    r"(?<!\w)(?:" + "|".join(block_keywords) + r")\s*(\([^)]*\))?\s*;",
+                    r"(?<!\w)(?:"
+                    + "|".join(block_keywords)
+                    + rf")\s*({_BLOCK_OPTIONS_PATTERN})?\s*;",
                     remaining_scan,
                     re.IGNORECASE,
                 )
@@ -3591,20 +3643,16 @@ def _detect_missing_shocks_semicolons_in_block(
 # @#include directive parsing
 # ---------------------------------------------------------------------------
 
-# Matches both the quoted and bare forms of @#include.  The filename is
-# captured from one of two alternative groups so callers can pick whichever
-# matched.  The directive extends to end-of-line; Dynare does not permit a
-# line continuation inside the path.
+# Capture the complete include argument.  It can be a quoted/bare path or a
+# macro string expression such as ``"sub/" + "defs.inc"`` or ``FILES[1]``.
 _INCLUDE_PATTERN = re.compile(
     r"""
     ^\ufeff?[ \t]*
     @\#\s*include              # the @#include directive (whitespace tolerant)
-    \s+
-    (?:
-        "([^"\n]+)"            # group 1: double-quoted filename
-      | '([^'\n]+)'            # group 2: single-quoted filename
-      | ([^\s"'][^\s\n]*)      # group 3: bare filename (no quotes)
-    )
+    [ \t]+
+    ([^\r\n]*?\S)             # group 1: complete argument
+    [ \t]*
+    (?=\r?$)
     """,
     re.VERBOSE | re.IGNORECASE | re.MULTILINE,
 )
@@ -3621,7 +3669,7 @@ _MACRO_DIRECTIVE_PATTERN = re.compile(
     @\#[ \t]*
     (define|includepath|elseif|endif|endfor|ifdef|ifndef|if|for|else|echo|error)
     \b
-    (?:[ \t]+([^\n]*))?
+    [ \t]*
     """,
     re.VERBOSE | re.IGNORECASE | re.MULTILINE,
 )
@@ -3750,8 +3798,11 @@ def _simple_macro_list_values(value: str) -> Optional[List[str]]:
         # exhaust memory / hang the parser on untrusted input.
         if abs(end - start) > _MAX_MACRO_RANGE:
             return None
-        step = 1 if start <= end else -1
-        return [str(item) for item in range(start, end + step, step)]
+        # Dynare's two-endpoint range has an implicit +1 step.  A descending
+        # range therefore has no values; it does not invent a -1 step.
+        if start > end:
+            return []
+        return [str(item) for item in range(start, end + 1)]
 
     match = _SIMPLE_MACRO_FOR_LIST_PATTERN.match(raw)
     if match is None:
@@ -3824,22 +3875,33 @@ def _macro_define_value(
     match: re.Match,
     allow_complex: bool = False,
 ) -> Optional[str]:
-    value = (
-        match.group(2)
-        or match.group(3)
-        or match.group(4)
-        or match.group(5)
-        or match.group(6)
-    )
-    if value is not None:
-        return value
+    for group in range(2, 7):
+        value = match.group(group)
+        if value is not None:
+            return value
     raw = match.group(7)
     if raw is None:
         return "1"
     if not allow_complex:
         return None
     raw = raw.strip()
-    return raw if _is_supported_complex_macro_value(raw) else None
+    return (
+        _normalize_macro_define_value(raw)
+        if _is_supported_complex_macro_value(raw)
+        else None
+    )
+
+
+def _normalize_macro_define_value(value: str) -> str:
+    """Reduce numeric macro expressions to the text Dynare interpolates."""
+    if _NUMERIC_LITERAL_RE.fullmatch(value):
+        return value
+    evaluated = _safe_eval(value, {})
+    if evaluated is None or not math.isfinite(evaluated):
+        return value
+    if evaluated.is_integer():
+        return str(int(evaluated))
+    return str(evaluated)
 
 
 def _resolve_plus_operand_defines(value: str, defines: Dict[str, str]) -> str:
@@ -3914,7 +3976,8 @@ def _extract_macro_defines(
     treated as out-of-scope by the LSP's macro substitution.
     """
     out: Dict[str, str] = {}
-    for m in _MACRO_DEFINE_PATTERN.finditer(text):
+    logical_text = _collapse_macro_continuations(text)
+    for m in _MACRO_DEFINE_PATTERN.finditer(logical_text):
         name = m.group(1)
         value = _macro_define_value(m, allow_complex)
         if value is None and allow_complex and out:
@@ -3931,6 +3994,7 @@ def _extract_macro_defines(
         if out:
             value = _substitute_macro_arg(value, out)
             value = _resolve_plus_operand_defines(value, out)
+        value = _normalize_macro_define_value(value)
         out[name] = value
     return out
 
@@ -4536,63 +4600,115 @@ def _parse_macro_directives(text: str) -> List[MacroDirective]:
     argument + source range, performs no interpretation.
     """
     results: List[MacroDirective] = []
+    covered_until = -1
     for m in _MACRO_DIRECTIVE_PATTERN.finditer(text):
+        if m.start() < covered_until:
+            continue
+        directive_end = _macro_directive_end(text, m.start())
+        covered_until = directive_end
         kind = m.group(1).lower()
-        argument = m.group(2)
-        if argument is not None:
-            argument = argument.strip()
-            if argument == "":
-                argument = None
+        argument = _collapse_macro_continuations(text[m.end() : directive_end]).strip()
+        if argument == "":
+            argument = None
         results.append(
             MacroDirective(
                 kind=kind,
                 argument=argument,
-                range=_range_from_match(text, m),
+                range=SourceRange(
+                    _offset_to_position(text, m.start()),
+                    _offset_to_position(text, directive_end),
+                ),
             )
         )
     return results
-
-
-# ``@#include`` with a string EXPRESSION argument (``@#include F`` or
-# ``@#include P + "/x.mod"``) — valid Dynare; the quoted pattern misses it.
-_EXPRESSION_INCLUDE_LINE_RE = re.compile(
-    r"^[ \t]*@#[ \t]*include[ \t]+(?![\"'])(\S[^\n]*?)[ \t]*$",
-    re.IGNORECASE | re.MULTILINE,
-)
 
 
 def _fold_include_expression(
     argument: str,
     defines: Dict[str, str],
 ) -> Optional[str]:
-    """Fold a string-concat include argument to a literal path, or None."""
-    parts = _split_top_level_macro_plus(argument.strip())
-    if not parts:
+    """Fold a Dynare string include expression to a literal path."""
+    unknown = object()
+
+    def _define_value(name: str, seen: set) -> object:
+        if name not in defines or name in seen:
+            return unknown
+        raw = defines[name].strip()
+        list_values = _simple_macro_list_values(raw)
+        if list_values is not None:
+            return list_values
+        if raw in defines:
+            resolved = _define_value(raw, seen | {name})
+            if resolved is not unknown:
+                return resolved
+        try:
+            tree = ast.parse(raw, mode="eval")
+        except SyntaxError:
+            return raw
+        resolved = _eval(tree.body, seen | {name})
+        return raw if resolved is unknown else resolved
+
+    def _eval(node: ast.AST, seen: set) -> object:
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (str, int)) and not isinstance(node.value, bool):
+                return node.value
+            return unknown
+        if isinstance(node, ast.Name):
+            return _define_value(node.id, seen)
+        if isinstance(node, (ast.List, ast.Tuple)):
+            values = [_eval(element, seen) for element in node.elts]
+            if any(value is unknown or not isinstance(value, str) for value in values):
+                return unknown
+            return values
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left = _eval(node.left, seen)
+            right = _eval(node.right, seen)
+            if isinstance(left, str) and isinstance(right, str):
+                return left + right
+            if isinstance(left, list) and isinstance(right, list):
+                return left + right
+            return unknown
+        if isinstance(node, ast.Subscript):
+            values = _eval(node.value, seen)
+            index = _eval(node.slice, seen)
+            if not isinstance(values, list) or type(index) is not int:
+                return unknown
+            # Dynare macro arrays are one-based.
+            if index < 1 or index > len(values):
+                return unknown
+            return values[index - 1]
+        return unknown
+
+    try:
+        parsed = ast.parse(argument.strip(), mode="eval")
+    except SyntaxError:
         return None
-    folded: List[str] = []
-    for part in parts:
-        part = part.strip()
-        if len(part) >= 2 and part[0] == part[-1] and part[0] in "\"'":
-            folded.append(part[1:-1])
-            continue
-        if re.fullmatch(r"[A-Za-z_]\w*", part):
-            value = defines.get(part)
-            if value is None:
-                return None
-            folded.append(value)
-            continue
+    value = _eval(parsed.body, set())
+    if not isinstance(value, str):
         return None
-    result = "".join(folded).strip()
-    return result or None
+    value = value.strip()
+    return value or None
+
+
+def _bare_include_literal(argument: str) -> Optional[str]:
+    """Return an unquoted path that is not a macro expression."""
+    raw = argument.strip()
+    if not re.fullmatch(r"[^\s\"'\[\]+]+", raw):
+        return None
+    if re.fullmatch(r"[A-Za-z_]\w*", raw):
+        return None
+    return raw
 
 
 def _has_unfoldable_expression_include(text: str) -> bool:
     """Whether an expression-form ``@#include`` resists constant folding."""
-    defines: Optional[Dict[str, str]] = None
-    for m in _EXPRESSION_INCLUDE_LINE_RE.finditer(text):
-        if defines is None:
-            defines = _extract_macro_defines(text, allow_complex=True)
-        if _fold_include_expression(m.group(1), defines) is None:
+    defines = _extract_macro_defines(text, allow_complex=True)
+    for match in _INCLUDE_PATTERN.finditer(text):
+        argument = match.group(1).strip()
+        if (
+            _fold_include_expression(argument, defines) is None
+            and _bare_include_literal(argument) is None
+        ):
             return True
     return False
 
@@ -4608,29 +4724,17 @@ def _parse_includes(text: str) -> List[IncludeDirective]:
     resolve like ordinary includes.
     """
     results: List[IncludeDirective] = []
+    defines = _extract_macro_defines(text, allow_complex=True)
     for m in _INCLUDE_PATTERN.finditer(text):
-        filename = m.group(1) or m.group(2) or m.group(3)
+        argument = m.group(1).strip()
+        filename = _fold_include_expression(argument, defines)
         if filename is None:
-            continue
-        filename = filename.strip()
+            filename = _bare_include_literal(argument)
         if not filename:
             continue
         results.append(
             IncludeDirective(
                 filename=filename,
-                range=_range_from_match(text, m),
-            )
-        )
-    defines: Optional[Dict[str, str]] = None
-    for m in _EXPRESSION_INCLUDE_LINE_RE.finditer(text):
-        if defines is None:
-            defines = _extract_macro_defines(text, allow_complex=True)
-        folded = _fold_include_expression(m.group(1), defines)
-        if folded is None:
-            continue
-        results.append(
-            IncludeDirective(
-                filename=folded,
                 range=_range_from_match(text, m),
             )
         )
@@ -4648,8 +4752,15 @@ def parse(
     line_macro_defines: Optional[Dict[int, Dict[str, str]]] = None,
 ) -> ParsedModel:
     """Parse a Dynare .mod file and return a structured AST with positions."""
+    original_text = text
+    # Python's line-oriented regexes and position cache recognize LF/CRLF.
+    # Normalize lone CR in place (same width) so old-Mac input has identical
+    # line boundaries and LSP locations without disturbing CRLF documents.
+    text = re.sub(r"\r(?!\n)", "\n", text)
     model = ParsedModel(
-        text=text, original_text=text, nostrict=_has_nostrict_option(text)
+        text=text,
+        original_text=original_text,
+        nostrict=_has_nostrict_option(text),
     )
     text = _mask_verbatim_blocks(text)
     model.text = text
@@ -4916,7 +5027,7 @@ def parse(
         m
         for m in _find_all_blocks(stripped, "model")
         if not re.search(
-            r"(?<!\w)(?:initval|endval|shocks|steady_state_model)\s*(\([^)]*\))?\s*;",
+            rf"(?<!\w)(?:initval|endval|shocks|steady_state_model)\s*({_BLOCK_OPTIONS_PATTERN})?\s*;",
             _mask_string_literals(m.group(2)),
             re.IGNORECASE,
         )
@@ -4931,7 +5042,7 @@ def parse(
             m
             for m in _find_all_blocks(macro_pre_masked, "model")
             if not re.search(
-                r"(?<!\w)(?:initval|endval|shocks|steady_state_model)\s*(\([^)]*\))?\s*;",
+                rf"(?<!\w)(?:initval|endval|shocks|steady_state_model)\s*({_BLOCK_OPTIONS_PATTERN})?\s*;",
                 _mask_string_literals(m.group(2)),
                 re.IGNORECASE,
             )
@@ -4984,7 +5095,9 @@ def parse(
         # If there's a model keyword but no end, record error and still parse
         # equations from the partial block so downstream checks work
         kw_match = re.search(
-            r"(?<!\w)model\s*(\([^)]*\))?\s*;", stripped, re.IGNORECASE
+            rf"(?<!\w)model\s*({_BLOCK_OPTIONS_PATTERN})?\s*;",
+            stripped,
+            re.IGNORECASE,
         )
         if kw_match:
             # Error will be reported by _detect_unmatched_blocks; don't duplicate
@@ -4993,7 +5106,7 @@ def parse(
             # Parse equations from after model; to next block keyword
             after_model = stripped[kw_match.end() :]
             next_block = re.search(
-                r"(?<!\w)(?:initval|endval|shocks|steady_state_model)\s*(\([^)]*\))?\s*;",
+                rf"(?<!\w)(?:initval|endval|shocks|steady_state_model)\s*({_BLOCK_OPTIONS_PATTERN})?\s*;",
                 _mask_string_literals(after_model),
                 re.IGNORECASE,
             )
@@ -5007,7 +5120,7 @@ def parse(
             )
             raw_stripped = macro_pre_masked
             raw_kw_match = re.search(
-                r"(?<!\w)model\s*(\([^)]*\))?\s*;",
+                rf"(?<!\w)model\s*({_BLOCK_OPTIONS_PATTERN})?\s*;",
                 raw_stripped,
                 re.IGNORECASE,
             )
@@ -5016,7 +5129,7 @@ def parse(
             if raw_kw_match:
                 raw_after_model = raw_stripped[raw_kw_match.end() :]
                 raw_next_block = re.search(
-                    r"(?<!\w)(?:initval|endval|shocks|steady_state_model)\s*(\([^)]*\))?\s*;",
+                    rf"(?<!\w)(?:initval|endval|shocks|steady_state_model)\s*({_BLOCK_OPTIONS_PATTERN})?\s*;",
                     _mask_string_literals(raw_after_model),
                     re.IGNORECASE,
                 )
@@ -5061,78 +5174,79 @@ def parse(
     model.model_replacements = _parse_model_replacements(stripped, text)
     model.var_removed_names = _parse_var_removed_names(stripped)
 
-    # --- steady_state_model block ---
-    ss_match = _find_block(stripped, "steady_state_model")
-    if ss_match:
-        body = ss_match.group(2)
-        body_offset = ss_match.start(2)
-        ss_equations = _parse_equations(body, body_offset, text)
-        # Expand resolvable @#for loops inside the block the same way the
-        # model block does — otherwise only the first iteration's
-        # assignments materialize and later variables look unassigned
-        # (false W040/W041/W042).
-        raw_ss_match = _find_block(macro_pre_masked, "steady_state_model")
-        ss_macro_body = raw_ss_match.group(2) if raw_ss_match else body
-        ss_macro_offset = raw_ss_match.start(2) if raw_ss_match else body_offset
-        ss_macro_equations, ss_macro_ranges = _parse_macro_for_equations(
-            ss_macro_body,
-            ss_macro_offset,
-            macro_active_text,
-            line_defines,
-        )
-        if ss_macro_equations:
-            ss_equations = [
-                eq
-                for eq in ss_equations
-                if not any(
-                    start <= eq.range.start.line <= end
-                    for start, end in ss_macro_ranges
+    # --- steady_state_model block(s) ---
+    ss_matches = _find_all_blocks(stripped, "steady_state_model")
+    raw_ss_matches = _find_all_blocks(macro_pre_masked, "steady_state_model")
+    if ss_matches:
+        all_ss_equations: List[Equation] = []
+        for block_idx, ss_match in enumerate(ss_matches):
+            body = ss_match.group(2)
+            body_offset = ss_match.start(2)
+            ss_equations = _parse_equations(body, body_offset, text)
+            # Expand resolvable @#for loops inside every block.  Dynare
+            # executes repeated steady-state blocks in source order.
+            raw_ss_match = (
+                raw_ss_matches[block_idx] if block_idx < len(raw_ss_matches) else None
+            )
+            ss_macro_body = raw_ss_match.group(2) if raw_ss_match else body
+            ss_macro_offset = raw_ss_match.start(2) if raw_ss_match else body_offset
+            ss_macro_equations, ss_macro_ranges = _parse_macro_for_equations(
+                ss_macro_body,
+                ss_macro_offset,
+                macro_active_text,
+                line_defines,
+            )
+            if ss_macro_equations:
+                ss_equations = [
+                    eq
+                    for eq in ss_equations
+                    if not any(
+                        start <= eq.range.start.line <= end
+                        for start, end in ss_macro_ranges
+                    )
+                ] + ss_macro_equations
+
+                # Each block is sequential.  Keep expanded loop equations in
+                # iteration-major order at the loop's source position.
+                def _ss_anchor(eq: Equation) -> int:
+                    line = eq.range.start.line
+                    for start, end in ss_macro_ranges:
+                        if start <= line <= end:
+                            return start
+                    return line
+
+                ss_equations.sort(key=_ss_anchor)
+            all_ss_equations.extend(ss_equations)
+        model.steady_state_equations = all_ss_equations
+        model.steady_state_block_range = _range_from_match(text, ss_matches[0])
+
+    # --- initval block(s) ---
+    iv_matches = _find_all_blocks(stripped, "initval")
+    if iv_matches:
+        for iv_match in iv_matches:
+            model.initval_entries.extend(
+                _parse_initval_block(
+                    iv_match.group(2),
+                    iv_match.start(2),
+                    text,
+                    model.param_values(),
                 )
-            ] + ss_macro_equations
+            )
+        model.initval_block_range = _range_from_match(text, iv_matches[0])
 
-            # steady_state_model statements are SEQUENTIAL; Dynare unrolls
-            # a loop iteration-by-iteration at the loop's position.  Sort
-            # by anchor line only (the loop's start line for expanded
-            # equations) — the stable sort keeps each expansion's
-            # iteration-major emission order, where a full positional sort
-            # would regroup it statement-major and break cross-iteration
-            # recursions (false W040/W041).
-            def _ss_anchor(eq: Equation) -> int:
-                line = eq.range.start.line
-                for start, end in ss_macro_ranges:
-                    if start <= line <= end:
-                        return start
-                return line
-
-            ss_equations.sort(key=_ss_anchor)
-        model.steady_state_equations = ss_equations
-        model.steady_state_block_range = _range_from_match(text, ss_match)
-
-    # --- initval block ---
-    iv_match = _find_block(stripped, "initval")
-    if iv_match:
-        body = iv_match.group(2)
-        body_offset = iv_match.start(2)
-        model.initval_entries = _parse_initval_block(
-            body,
-            body_offset,
-            text,
-            model.param_values(),
-        )
-        model.initval_block_range = _range_from_match(text, iv_match)
-
-    # --- endval block ---
-    ev_match = _find_block(stripped, "endval")
-    if ev_match:
-        body = ev_match.group(2)
-        body_offset = ev_match.start(2)
-        model.endval_entries = _parse_initval_block(
-            body,
-            body_offset,
-            text,
-            model.param_values(),
-        )
-        model.endval_block_range = _range_from_match(text, ev_match)
+    # --- endval block(s) ---
+    ev_matches = _find_all_blocks(stripped, "endval")
+    if ev_matches:
+        for ev_match in ev_matches:
+            model.endval_entries.extend(
+                _parse_initval_block(
+                    ev_match.group(2),
+                    ev_match.start(2),
+                    text,
+                    model.param_values(),
+                )
+            )
+        model.endval_block_range = _range_from_match(text, ev_matches[0])
 
     # --- shocks block(s) ---
     # Dynare allows multiple ``shocks; ... end;`` blocks in a single file

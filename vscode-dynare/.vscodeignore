@@ -3,3 +3,8 @@ tsconfig.json
 .gitignore
 **/*.ts
 **/*.map
+**/__pycache__/**
+**/.pytest_cache/**
+**/.ruff_cache/**
+**/.mypy_cache/**
+**/*.py[co]

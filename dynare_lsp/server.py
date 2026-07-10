@@ -15,6 +15,7 @@ Provides:
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import logging
 import os
@@ -24,7 +25,7 @@ import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, cast
 
 try:
@@ -105,7 +106,7 @@ if TYPE_CHECKING:
 
 server = LanguageServer(
     "dynare-language-server",
-    "v0.3.1",
+    "v0.4.0",
     text_document_sync_kind=lsp.TextDocumentSyncKind.Full,
 )
 
@@ -479,6 +480,10 @@ _client_send_lock = threading.Lock()
 # Cache parsed models keyed by document URI
 _document_models: dict[str, ParsedModel] = {}
 
+# Monotonic per-document generations.  Background work captures the current
+# generation and may only cache or publish results while it still matches.
+_document_generations: dict[str, int] = {}
+
 # Cache diagnostics for code actions
 _document_diagnostics: dict[str, List[DDiag]] = {}
 
@@ -513,6 +518,7 @@ _document_ss_reports: dict[str, Optional["SteadyStateReport"]] = {}
 # Background solver infrastructure
 _solve_executor = ThreadPoolExecutor(max_workers=1)
 _pending_solves: dict[str, threading.Timer] = {}  # uri -> debounce timer
+_solve_generations: dict[str, int] = {}
 
 # Background preprocessor infrastructure
 _preprocess_executor = ThreadPoolExecutor(max_workers=1)
@@ -604,6 +610,13 @@ def _contextual_open_include_model(
         stripped,
     )
     included_context = _context_from_included_view(included_view)
+    view.include_context = included_context
+    view.context_closing_block = getattr(
+        included_view,
+        "context_closing_block",
+        None,
+    )
+    view.include_anchor_range = getattr(included_view, "include_anchor_range", None)
     if included_context == "model" and not view.model_equations:
         view.model_equations = _parse_equations(
             context_body,
@@ -725,6 +738,11 @@ def _validate_document(uri: str, text: str) -> None:
     # soon as a fresh validation starts so pull diagnostics and inlay
     # hints cannot mix a new parse with stale solver/BK/preprocessor data.
     with _state_lock:
+        generation = _document_generations.get(uri, 0) + 1
+        _document_generations[uri] = generation
+        # Invalidate a timer callback or executor job that was scheduled for
+        # the prior parse before the replacement solve is debounced below.
+        _solve_generations[uri] = _solve_generations.get(uri, 0) + 1
         _document_models.pop(uri, None)
         previous_solver_result = _document_solver_results.pop(uri, None)
         if previous_solver_result is not None and getattr(
@@ -871,6 +889,8 @@ def _validate_document(uri: str, text: str) -> None:
         )
 
         with _state_lock:
+            if _document_generations.get(uri, 0) != generation:
+                return
             _document_models[uri] = model
             _document_diagnostics[uri] = diagnostics
             _document_ss_reports[uri] = ss_report
@@ -885,14 +905,13 @@ def _validate_document(uri: str, text: str) -> None:
             )
         ]
         with _state_lock:
+            if _document_generations.get(uri, 0) != generation:
+                return
             _document_diagnostics[uri] = diagnostics
             _document_ss_reports[uri] = None
 
     lsp_diagnostics = [_to_lsp_diagnostic(d, text) for d in diagnostics]
-    with _client_send_lock:
-        server.text_document_publish_diagnostics(
-            lsp.PublishDiagnosticsParams(uri=uri, diagnostics=lsp_diagnostics)
-        )
+    _publish_diagnostics_if_current(uri, lsp_diagnostics, generation)
 
 
 def _dedupe_diagnostics(diags: List[DDiag]) -> List[DDiag]:
@@ -924,9 +943,43 @@ def _dedupe_diagnostics(diags: List[DDiag]) -> List[DDiag]:
     return out
 
 
-def _publish_all_diagnostics(uri: str) -> None:
+def _publish_diagnostics_if_current(
+    uri: str,
+    diagnostics: List[lsp.Diagnostic],
+    generation: int,
+    *,
+    refresh_inlay_hints: bool = False,
+) -> bool:
+    """Publish only if *generation* is still the URI's newest analysis."""
+    with _client_send_lock:
+        with _state_lock:
+            if _document_generations.get(uri, 0) != generation:
+                return False
+        server.text_document_publish_diagnostics(
+            lsp.PublishDiagnosticsParams(uri=uri, diagnostics=diagnostics)
+        )
+        if refresh_inlay_hints:
+            try:
+                server.workspace_inlay_hint_refresh(None)
+            except Exception:
+                pass
+    return True
+
+
+def _publish_all_diagnostics(
+    uri: str,
+    expected_generation: Optional[int] = None,
+) -> None:
     """Merge base + BK + preprocessor diagnostics and publish."""
     with _state_lock:
+        current_generation = _document_generations.get(uri, 0)
+        generation = (
+            current_generation
+            if expected_generation is None
+            else expected_generation
+        )
+        if generation != current_generation:
+            return
         base_diags = _document_diagnostics.get(uri, [])
         bk_result = _document_bk_results.get(uri)
         model_diagnostics = _document_model_diagnostics.get(uri, [])
@@ -988,14 +1041,12 @@ def _publish_all_diagnostics(uri: str) -> None:
     all_diags.extend(run_diagnostics)
     all_diags = _dedupe_diagnostics(all_diags)
     lsp_diagnostics = [_to_lsp_diagnostic(d, source_text) for d in all_diags]
-    with _client_send_lock:
-        server.text_document_publish_diagnostics(
-            lsp.PublishDiagnosticsParams(uri=uri, diagnostics=lsp_diagnostics)
-        )
-        try:
-            server.workspace_inlay_hint_refresh(None)
-        except Exception:
-            pass
+    _publish_diagnostics_if_current(
+        uri,
+        lsp_diagnostics,
+        generation,
+        refresh_inlay_hints=True,
+    )
 
 
 def _revalidate_cached_documents(
@@ -1029,24 +1080,30 @@ def _schedule_solve(uri: str) -> None:
     """Schedule a background steady state solve, debounced by 1 second."""
     with _state_lock:
         timer = _pending_solves.pop(uri, None)
+        solve_generation = _solve_generations.get(uri, 0) + 1
+        _solve_generations[uri] = solve_generation
+        document_generation = _document_generations.get(uri, 0)
+        scheduled_model = _document_models.get(uri)
     if timer is not None:
         timer.cancel()
 
     def _do_solve():
         with _state_lock:
-            _pending_solves.pop(uri, None)
+            if _pending_solves.get(uri) is new_timer:
+                _pending_solves.pop(uri, None)
+            current = _document_models.get(uri)
+            if (
+                _solve_generations.get(uri, 0) != solve_generation
+                or _document_generations.get(uri, 0) != document_generation
+                or current is not scheduled_model
+            ):
+                logger.info("Auto-solve: discarding stale scheduled run for %s", uri)
+                return
         logger.info("Auto-solve: starting for %s", uri)
-        # Capture the model AND a version token so a mid-flight edit
-        # doesn't cause us to write stale solver / BK results back to
-        # the cache.  The token is ``id(model)`` — every ``parse()``
-        # produces a fresh ParsedModel object, so the identity changes
-        # the instant ``_validate_document`` re-parses on a did_change.
-        with _state_lock:
-            model = _document_models.get(uri)
+        model = scheduled_model
         if model is None:
             logger.info("Auto-solve: no model cached, skipping")
             return
-        version_token = id(model)
         model_source = getattr(model, "original_text", "") or model.text
         solve_files = _workspace_files_for_execution(uri, model_source)
 
@@ -1075,6 +1132,19 @@ def _schedule_solve(uri: str) -> None:
             )
             return
 
+        if not _execution_snapshot_is_current(solve_files):
+            logger.info("Auto-solve: execution snapshot is stale, skipping %s", uri)
+            return
+        with _state_lock:
+            current = _document_models.get(uri)
+            if (
+                _solve_generations.get(uri, 0) != solve_generation
+                or _document_generations.get(uri, 0) != document_generation
+                or current is not model
+            ):
+                logger.info("Auto-solve: stale before solver invocation for %s", uri)
+                return
+
         try:
             from .solver import compute_steady_state, default_solve_budget
         except ImportError:
@@ -1101,7 +1171,12 @@ def _schedule_solve(uri: str) -> None:
         snapshot_current = _execution_snapshot_is_current(solve_files)
         with _state_lock:
             current = _document_models.get(uri)
-            if current is None or id(current) != version_token or not snapshot_current:
+            if (
+                _solve_generations.get(uri, 0) != solve_generation
+                or _document_generations.get(uri, 0) != document_generation
+                or current is not model
+                or not snapshot_current
+            ):
                 # Document was edited (or closed) while we computed —
                 # discard the stale result rather than overwrite the
                 # cache with a value that no longer matches the model.
@@ -1127,8 +1202,9 @@ def _schedule_solve(uri: str) -> None:
                 with _state_lock:
                     current = _document_models.get(uri)
                     if (
-                        current is None
-                        or id(current) != version_token
+                        _solve_generations.get(uri, 0) != solve_generation
+                        or _document_generations.get(uri, 0) != document_generation
+                        or current is not model
                         or not snapshot_current
                     ):
                         logger.info("Auto-solve: discarding stale BK for %s", uri)
@@ -1149,8 +1225,9 @@ def _schedule_solve(uri: str) -> None:
                 with _state_lock:
                     current = _document_models.get(uri)
                     if (
-                        current is None
-                        or id(current) != version_token
+                        _solve_generations.get(uri, 0) != solve_generation
+                        or _document_generations.get(uri, 0) != document_generation
+                        or current is not model
                         or not snapshot_current
                     ):
                         logger.info(
@@ -1177,8 +1254,9 @@ def _schedule_solve(uri: str) -> None:
                 with _state_lock:
                     current = _document_models.get(uri)
                     if (
-                        current is None
-                        or id(current) != version_token
+                        _solve_generations.get(uri, 0) != solve_generation
+                        or _document_generations.get(uri, 0) != document_generation
+                        or current is not model
                         or not snapshot_current
                     ):
                         logger.info(
@@ -1194,9 +1272,21 @@ def _schedule_solve(uri: str) -> None:
             except Exception as e:
                 logger.info("Auto-solve: identification failed: %s", e)
 
-        _publish_all_diagnostics(uri)
+        _publish_all_diagnostics(uri, document_generation)
 
-    new_timer = threading.Timer(1.0, lambda: _solve_executor.submit(_do_solve))
+    def _submit_if_current() -> None:
+        with _state_lock:
+            if (
+                _pending_solves.get(uri) is not new_timer
+                or _solve_generations.get(uri, 0) != solve_generation
+                or _document_generations.get(uri, 0) != document_generation
+                or _document_models.get(uri) is not scheduled_model
+            ):
+                logger.info("Auto-solve: discarding stale debounce for %s", uri)
+                return
+        _solve_executor.submit(_do_solve)
+
+    new_timer = threading.Timer(1.0, _submit_if_current)
     new_timer.daemon = True
     new_timer.start()
     with _state_lock:
@@ -1262,6 +1352,7 @@ def _schedule_preprocess(uri: str) -> None:
 
     with _state_lock:
         scheduled_model = _document_models.get(uri)
+        scheduled_generation = _document_generations.get(uri, 0)
     if scheduled_model is None:
         logger.info("Preprocessor: document not available, skipping %s", uri)
         return
@@ -1281,7 +1372,10 @@ def _schedule_preprocess(uri: str) -> None:
         with _state_lock:
             _pending_preprocess.pop(uri, None)
             current = _document_models.get(uri)
-            if current is None or current is not scheduled_model:
+            if (
+                current is not scheduled_model
+                or _document_generations.get(uri, 0) != scheduled_generation
+            ):
                 logger.info("Preprocessor: discarding stale scheduled run for %s", uri)
                 return
 
@@ -1323,8 +1417,8 @@ def _schedule_preprocess(uri: str) -> None:
             with _state_lock:
                 current = _document_models.get(uri)
                 if (
-                    current is None
-                    or current is not scheduled_model
+                    current is not scheduled_model
+                    or _document_generations.get(uri, 0) != scheduled_generation
                     or not snapshot_current
                 ):
                     logger.info("Preprocessor: discarding stale result for %s", uri)
@@ -1339,7 +1433,7 @@ def _schedule_preprocess(uri: str) -> None:
             logger.info("Preprocessor: failed: %s", e)
             return
 
-        _publish_all_diagnostics(uri)
+        _publish_all_diagnostics(uri, scheduled_generation)
 
     new_timer = threading.Timer(
         2.0, lambda: _preprocess_executor.submit(_do_preprocess)
@@ -1372,6 +1466,9 @@ def did_close(params: lsp.DidCloseTextDocumentParams) -> None:
     if handle is not None:
         handle.cancel()
     with _state_lock:
+        close_generation = _document_generations.get(uri, 0) + 1
+        _document_generations[uri] = close_generation
+        _solve_generations[uri] = _solve_generations.get(uri, 0) + 1
         _document_models.pop(uri, None)
         _document_diagnostics.pop(uri, None)
         _document_solver_results.pop(uri, None)
@@ -1387,10 +1484,7 @@ def did_close(params: lsp.DidCloseTextDocumentParams) -> None:
     except Exception:
         logger.exception("Workspace index cleanup failed for %s", uri)
     _revalidate_cached_documents(schedule_solve=True, exclude_uri=uri)
-    with _client_send_lock:
-        server.text_document_publish_diagnostics(
-            lsp.PublishDiagnosticsParams(uri=uri, diagnostics=[])
-        )
+    _publish_diagnostics_if_current(uri, [], close_generation)
 
 
 # ---------------------------------------------------------------------------
@@ -2368,10 +2462,19 @@ def _path_to_uri(path_key: str) -> str:
     (which only happens for relative paths — the index shouldn't store
     those, but better safe than crashing a handler).
     """
+    raw_path = _strip_include_instance_suffix(path_key)
+    path = Path(raw_path)
     try:
-        return Path(_strip_include_instance_suffix(path_key)).as_uri()
+        # Workspace keys are case-folded on Windows.  Resolve before emitting a
+        # public URI so an indexed path does not leak that internal casing into
+        # editor locations or fail an open-document lookup.
+        path = path.resolve()
+    except (OSError, RuntimeError):
+        pass
+    try:
+        return path.as_uri()
     except ValueError:
-        return _strip_include_instance_suffix(path_key)
+        return raw_path
 
 
 def _find_declaration_across_workspace_with_model(
@@ -3996,6 +4099,81 @@ def _find_ss_insert_line(model: ParsedModel, lines: List[str]) -> int:
     return len(lines)
 
 
+def _compute_ss_document_is_current(
+    uri: str,
+    model: ParsedModel,
+    document_version: Optional[int],
+    document_text: str,
+) -> bool:
+    """Check both the parsed model and live document captured for a solve."""
+    try:
+        current_doc = server.workspace.get_text_document(uri)
+        current_text = current_doc.source
+        current_version = getattr(current_doc, "version", None)
+    except Exception:
+        return False
+    if document_version is not None:
+        if current_version != document_version:
+            return False
+    elif current_text != document_text:
+        return False
+    with _state_lock:
+        return _document_models.get(uri) is model
+
+
+def _compute_ss_workspace_edit(
+    uri: str,
+    edits: List[lsp.TextEdit],
+    document_version: Optional[int],
+) -> lsp.WorkspaceEdit:
+    """Use a versioned edit when the client supplied a document version."""
+    if document_version is not None:
+        return lsp.WorkspaceEdit(
+            document_changes=[
+                lsp.TextDocumentEdit(
+                    text_document=lsp.OptionalVersionedTextDocumentIdentifier(
+                        uri=uri,
+                        version=document_version,
+                    ),
+                    edits=edits,
+                )
+            ]
+        )
+    return lsp.WorkspaceEdit(changes={uri: edits})
+
+
+def _compute_ss_changed_result(prepared: Optional[dict] = None) -> dict:
+    if prepared is not None:
+        uri = prepared.get("uri")
+        result = prepared.get("result")
+        if isinstance(uri, str):
+            with _state_lock:
+                if _document_solver_results.get(uri) is result:
+                    _document_solver_results.pop(uri, None)
+    return {
+        "success": False,
+        "message": "Document changed before steady state could be applied",
+    }
+
+
+def _compute_ss_prepared_is_current(prepared: dict) -> bool:
+    uri = prepared.get("uri")
+    model = prepared.get("model")
+    document_text = prepared.get("document_text")
+    if (
+        not isinstance(uri, str)
+        or not isinstance(model, ParsedModel)
+        or not isinstance(document_text, str)
+    ):
+        return False
+    return _compute_ss_document_is_current(
+        uri,
+        model,
+        prepared.get("document_version"),
+        document_text,
+    )
+
+
 def _compute_ss_prepare(*args) -> Optional[dict]:
     """Prepare steady-state edit payload or return a terminal command result."""
     if len(args) == 1 and isinstance(args[0], list):
@@ -4019,7 +4197,18 @@ def _compute_ss_prepare(*args) -> Optional[dict]:
         model = _document_models.get(uri)
     if model is None:
         return {"done": {"success": False, "message": "No parsed model available"}}
-    version_token = id(model)
+    try:
+        doc = server.workspace.get_text_document(uri)
+        document_text = doc.source
+        raw_document_version = getattr(doc, "version", None)
+        document_version = (
+            raw_document_version if isinstance(raw_document_version, int) else None
+        )
+    except Exception:
+        return {"done": {"success": False, "message": "Document not available"}}
+    model_text = getattr(model, "original_text", "") or model.text
+    if model_text != document_text:
+        return {"done": _compute_ss_changed_result()}
     include_models = None
     try:
         include_models = list(_workspace_index.resolve_all_includes(uri).values())
@@ -4047,15 +4236,17 @@ def _compute_ss_prepare(*args) -> Optional[dict]:
         return {"done": {"success": False, "message": "scipy not installed"}}
 
     result = compute_steady_state(solve_model, time_budget=default_solve_budget())
+    if not _compute_ss_document_is_current(
+        uri,
+        model,
+        document_version,
+        document_text,
+    ):
+        return {"done": _compute_ss_changed_result()}
     with _state_lock:
         current = _document_models.get(uri)
-        if current is None or id(current) != version_token:
-            return {
-                "done": {
-                    "success": False,
-                    "message": "Document changed before steady state could be applied",
-                }
-            }
+        if current is not model:
+            return {"done": _compute_ss_changed_result()}
         _document_solver_results[uri] = result
         if result.success:
             _document_warm_start_results[uri] = result
@@ -4067,23 +4258,26 @@ def _compute_ss_prepare(*args) -> Optional[dict]:
                 message=f"Steady state computation failed: {result.message}",
             )
         )
-        doc = server.workspace.get_text_document(uri)
-        _validate_document(uri, doc.source)
+        current_doc = server.workspace.get_text_document(uri)
+        _validate_document(uri, current_doc.source)
         return {"done": {"success": False, "message": result.message}}
 
     # Build edits: update an existing initval block when present, otherwise
     # insert a fresh block after the model.
-    doc = server.workspace.get_text_document(uri)
-    lines = doc.source.split("\n")
+    lines = document_text.split("\n")
     if model.initval_block_range is not None:
         edits = _build_initval_update_edits(result.values, model, solve_model)
         if edits:
-            edit = lsp.WorkspaceEdit(changes={uri: edits})
+            edit = _compute_ss_workspace_edit(uri, edits, document_version)
             return {
                 "done": None,
                 "edit": edit,
                 "result": result,
                 "action": "Updated initval block",
+                "uri": uri,
+                "model": model,
+                "document_version": document_version,
+                "document_text": document_text,
             }
         return {
             "done": {
@@ -4098,35 +4292,28 @@ def _compute_ss_prepare(*args) -> Optional[dict]:
     insert_line = _find_ss_insert_line(model, lines)
     insert_pos, initval_text = _valid_line_insert(lines, insert_line, initval_text)
 
-    with _state_lock:
-        current = _document_models.get(uri)
-        if current is None or id(current) != version_token:
-            _document_solver_results.pop(uri, None)
-            return {
-                "done": {
-                    "success": False,
-                    "message": "Document changed before steady state could be applied",
-                }
-            }
-
-    edit = lsp.WorkspaceEdit(
-        changes={
-            uri: [
-                lsp.TextEdit(
-                    range=lsp.Range(
-                        start=insert_pos,
-                        end=insert_pos,
-                    ),
-                    new_text=initval_text,
-                )
-            ]
-        }
+    edit = _compute_ss_workspace_edit(
+        uri,
+        [
+            lsp.TextEdit(
+                range=lsp.Range(
+                    start=insert_pos,
+                    end=insert_pos,
+                ),
+                new_text=initval_text,
+            )
+        ],
+        document_version,
     )
     return {
         "done": None,
         "edit": edit,
         "result": result,
         "action": "Inserted initval block",
+        "uri": uri,
+        "model": model,
+        "document_version": document_version,
+        "document_text": document_text,
     }
 
 
@@ -4163,11 +4350,6 @@ def _compute_ss_finish(
     }
 
 
-@server.thread()
-def _wait_for_apply_edit_result(apply_result):
-    return apply_result.result(timeout=5)
-
-
 def compute_ss_command(*args) -> Optional[dict]:
     """Execute steady state computation and insert results."""
     prepared = _compute_ss_prepare(*args)
@@ -4175,6 +4357,8 @@ def compute_ss_command(*args) -> Optional[dict]:
         return None
     if prepared.get("done") is not None:
         return prepared["done"]
+    if not _compute_ss_prepared_is_current(prepared):
+        return _compute_ss_changed_result(prepared)
 
     apply_result = server.workspace_apply_edit(
         lsp.ApplyWorkspaceEditParams(
@@ -4197,24 +4381,42 @@ def compute_ss_command(*args) -> Optional[dict]:
     return _compute_ss_finish(prepared, apply_result)
 
 
+async def _compute_ss_prepare_for_protocol(args: Tuple[Any, ...]) -> Optional[dict]:
+    """Run the expensive command preparation away from the protocol loop."""
+    uri = _uri_from_command_args(args)
+    pending_solve = None
+    if uri is not None:
+        with _state_lock:
+            pending_solve = _pending_solves.pop(uri, None)
+            _solve_generations[uri] = _solve_generations.get(uri, 0) + 1
+    if pending_solve is not None:
+        pending_solve.cancel()
+    return await asyncio.wrap_future(
+        _solve_executor.submit(_compute_ss_prepare, *args)
+    )
+
+
 @server.command("dynare/computeSteadyState")
-def _compute_ss_command_protocol(*args):
+async def _compute_ss_command_protocol(*args):
     """Protocol-safe steady-state command handler."""
-    prepared = _compute_ss_prepare(*args)
+    prepared = await _compute_ss_prepare_for_protocol(args)
     if prepared is None:
         return None
     if prepared.get("done") is not None:
         return prepared["done"]
+    if not _compute_ss_prepared_is_current(prepared):
+        return _compute_ss_changed_result(prepared)
 
-    apply_result = server.workspace_apply_edit(
-        lsp.ApplyWorkspaceEditParams(
-            edit=prepared["edit"],
-            label="Insert computed steady state",
-        )
-    )
     try:
-        if hasattr(apply_result, "result"):
-            apply_result = yield _wait_for_apply_edit_result, (apply_result,), {}
+        apply_result = await asyncio.wait_for(
+            server.workspace_apply_edit_async(
+                lsp.ApplyWorkspaceEditParams(
+                    edit=prepared["edit"],
+                    label="Insert computed steady state",
+                )
+            ),
+            timeout=5,
+        )
     except Exception as exc:
         message = f"Failed to apply steady state edit: {exc}"
         server.window_show_message(
@@ -4268,6 +4470,10 @@ def _source_dir_for_uri(uri: str) -> Optional[str]:
         return None
 
 
+class _AmbiguousPreprocessorContextError(RuntimeError):
+    """Raised when an include fragment has no single executable parent."""
+
+
 def _preprocessor_scope_for_uri(
     uri: str,
     text: str,
@@ -4297,6 +4503,15 @@ def _preprocessor_scope_for_uri(
                 _workspace_index,
                 parent_contexts,
             )
+            if _ambiguous_parents:
+                parent_names = ", ".join(
+                    _display_parent_context_name(parent_uri)
+                    for parent_uri in _ambiguous_parents
+                )
+                raise _AmbiguousPreprocessorContextError(
+                    "Preprocessor skipped: include context is ambiguous across "
+                    f"{parent_names}"
+                )
             if parent_context is not None:
                 parent_uri, _parent_model, _included_model = parent_context
                 parent_text = _command_document_text(parent_uri)
@@ -4307,6 +4522,8 @@ def _preprocessor_scope_for_uri(
                         _source_dir_for_uri(parent_uri),
                         uri,
                     )
+    except _AmbiguousPreprocessorContextError:
+        raise
     except Exception:
         logger.exception("Preprocessor parent scope lookup failed for %s", uri)
     return uri, text, _source_dir_for_uri(uri), None
@@ -4334,14 +4551,22 @@ def _scope_preprocessor_result_to_include(preproc_result, active_include_uri):
 
 
 def _execution_file_key(uri_or_path: str) -> str:
-    try:
-        if uri_or_path.startswith("file://"):
+    if uri_or_path.startswith("file://"):
+        try:
             from .include_resolver import _uri_to_path
 
-            return str(_uri_to_path(uri_or_path))
-    except Exception:
-        pass
-    return _strip_include_instance_suffix(uri_or_path)
+            path = _uri_to_path(uri_or_path)
+            try:
+                return str(path.resolve())
+            except (OSError, RuntimeError):
+                return str(path)
+        except Exception:
+            return uri_or_path
+    raw_path = _strip_include_instance_suffix(uri_or_path)
+    try:
+        return str(Path(raw_path).resolve())
+    except (OSError, RuntimeError):
+        return raw_path
 
 
 def _workspace_files_for_execution(entry_uri: str, entry_text: str) -> Dict[str, str]:
@@ -4390,6 +4615,167 @@ def _execution_snapshot_is_current(files: Dict[str, str]) -> bool:
     return True
 
 
+def _execution_workspace_targets(
+    entry_file: str,
+    files: Dict[str, str],
+    tmp_root: Path,
+) -> Tuple[Path, Dict[str, Path]]:
+    """Plan collision-free snapshot paths while preserving filesystem roots."""
+    normalized = {
+        fname: Path(_strip_include_instance_suffix(fname)) for fname in files
+    }
+    entry_path = normalized.get(
+        entry_file,
+        Path(_strip_include_instance_suffix(entry_file)),
+    )
+    all_paths = [entry_path, *normalized.values()]
+    parents = [str(path.parent) for path in all_paths]
+
+    try:
+        common_parent: Optional[Path] = Path(os.path.commonpath(parents))
+    except ValueError:
+        common_parent = None
+
+    def _safe_relative(path: Path) -> Path:
+        if path.is_absolute() or any(part == ".." for part in path.parts):
+            return Path(path.name)
+        return path
+
+    if common_parent is not None:
+
+        def _relative_path(path: Path) -> Path:
+            try:
+                rel = Path(os.path.relpath(str(path), str(common_parent)))
+            except ValueError:
+                rel = Path(path.name)
+            if rel.is_absolute() or any(part == ".." for part in rel.parts):
+                return Path(path.name)
+            return rel
+
+        entry_relative = _relative_path(entry_path)
+    else:
+        # os.path.commonpath rejects different Windows drives and mixed
+        # absolute/relative keys.  Namespace each absolute root so files on
+        # C:, D:, or separate UNC shares cannot collapse to one basename.
+        anchor_keys = sorted(
+            {
+                os.path.normcase(path.anchor)
+                for path in all_paths
+                if path.is_absolute()
+            }
+        )
+        anchor_indexes = {anchor: index for index, anchor in enumerate(anchor_keys)}
+
+        def _rooted_path(path: Path) -> Path:
+            anchor = os.path.normcase(path.anchor)
+            try:
+                rel = path.relative_to(path.anchor)
+            except ValueError:
+                rel = Path(path.name)
+            return Path("__roots__") / f"root_{anchor_indexes[anchor]}" / rel
+
+        entry_relative = (
+            _rooted_path(entry_path)
+            if entry_path.is_absolute()
+            else _safe_relative(entry_path)
+        )
+
+        def _relative_path(path: Path) -> Path:
+            if path.is_absolute():
+                return _rooted_path(path)
+            return entry_relative.parent / _safe_relative(path)
+
+    targets = {
+        fname: tmp_root / _relative_path(path) for fname, path in normalized.items()
+    }
+    seen_targets: Dict[str, str] = {}
+    for fname, target in targets.items():
+        target_key = os.path.normcase(os.path.abspath(str(target)))
+        previous = seen_targets.get(target_key)
+        if previous is not None and previous != fname:
+            raise ValueError(
+                "Cannot stage execution snapshot: supplied paths "
+                f"{previous!r} and {fname!r} map to the same temporary file "
+                f"{str(target)!r}"
+            )
+        seen_targets[target_key] = fname
+
+    entry_parent = (tmp_root / entry_relative).parent
+    return entry_parent, targets
+
+
+_SNAPSHOT_INCLUDEPATH_RE = re.compile(
+    r"^(?P<prefix>[ \t]*@#\s*includepath\s*)(?P<quote>[\"'])(?P<value>[^\"'\r\n]*)(?P=quote)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _rewrite_snapshot_includepaths(
+    content: str,
+    entry_file: str,
+    targets: Dict[str, Path],
+) -> str:
+    """Redirect supplied include-search directories into the temp mirror."""
+    from .preprocessor import _split_includepath_argument
+
+    entry_dir = Path(_strip_include_instance_suffix(entry_file)).parent
+    mirror_dir_by_norm: Dict[str, str] = {}
+    target_paths = list(targets.values())
+    common_target_root = (
+        target_paths[0].parent
+        if len(target_paths) == 1
+        else Path(os.path.commonpath([str(target) for target in target_paths]))
+    )
+    for fname, target in targets.items():
+        original_parent = Path(_strip_include_instance_suffix(fname)).parent
+        mirror_parent = target.parent
+        while True:
+            try:
+                norm_parent = os.path.normcase(
+                    os.path.abspath(str(original_parent))
+                )
+            except (OSError, ValueError):
+                break
+            mirror_dir_by_norm.setdefault(norm_parent, str(mirror_parent))
+            if mirror_parent == common_target_root:
+                break
+            next_original = original_parent.parent
+            next_mirror = mirror_parent.parent
+            if next_original == original_parent or next_mirror == mirror_parent:
+                break
+            original_parent = next_original
+            mirror_parent = next_mirror
+
+    def _repl(match: re.Match) -> str:
+        parts = _split_includepath_argument(match.group("value"))
+        if not parts:
+            return match.group(0)
+        rewritten_parts: List[str] = []
+        changed = False
+        for part in parts:
+            is_absolute = PureWindowsPath(part).is_absolute() or PurePosixPath(
+                part
+            ).is_absolute()
+            original_dir = Path(part) if is_absolute else entry_dir / part
+            try:
+                norm_dir = os.path.normcase(os.path.abspath(str(original_dir)))
+            except (OSError, ValueError):
+                rewritten_parts.append(part)
+                continue
+            mirror_dir = mirror_dir_by_norm.get(norm_dir)
+            if mirror_dir is None:
+                rewritten_parts.append(part)
+                continue
+            rewritten_parts.append(mirror_dir.replace("\\", "/"))
+            changed = True
+        if not changed:
+            return match.group(0)
+        quote = match.group("quote")
+        return f"{match.group('prefix')}{quote}{':'.join(rewritten_parts)}{quote}"
+
+    return _SNAPSHOT_INCLUDEPATH_RE.sub(_repl, content)
+
+
 def _materialize_execution_workspace(
     entry_file: str,
     files: Dict[str, str],
@@ -4405,28 +4791,12 @@ def _materialize_execution_workspace(
     from .preprocessor import rewrite_supplied_absolute_includes
 
     normalized = {fname: Path(_strip_include_instance_suffix(fname)) for fname in files}
-    parents = [str(path.parent) for path in normalized.values()]
-    try:
-        common_parent = Path(os.path.commonpath(parents))
-    except ValueError:
-        common_parent = normalized[entry_file].parent
-
-    def _relative_path(fname: str) -> Path:
-        path = normalized[fname]
-        try:
-            rel = path.relative_to(common_parent)
-        except ValueError:
-            rel = Path(path.name)
-        if rel.is_absolute() or any(part == ".." for part in rel.parts):
-            return Path(path.name)
-        return rel
-
-    entry_parent = tmp_root / _relative_path(entry_file).parent
+    entry_parent, targets = _execution_workspace_targets(entry_file, files, tmp_root)
     entry_parent.mkdir(parents=True, exist_ok=True)
     planned: List[Tuple[str, Path]] = []
     target_by_norm: Dict[str, str] = {}
     for fname in files:
-        target = tmp_root / _relative_path(fname)
+        target = targets[fname]
         planned.append((fname, target))
         try:
             norm_key = os.path.normcase(os.path.abspath(str(normalized[fname])))
@@ -4434,26 +4804,18 @@ def _materialize_execution_workspace(
             continue
         target_by_norm[norm_key] = str(target)
     rewritten = {
-        fname: rewrite_supplied_absolute_includes(files[fname], target_by_norm)
+        fname: _rewrite_snapshot_includepaths(
+            rewrite_supplied_absolute_includes(files[fname], target_by_norm),
+            entry_file,
+            targets,
+        )
         for fname, _target in planned
     }
 
-    basename_counts: Dict[str, int] = {}
-    materialized: List[Tuple[str, Path]] = []
     for fname, target in planned:
         content = rewritten[fname]
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
-        materialized.append((content, target))
-        basename_counts[target.name] = basename_counts.get(target.name, 0) + 1
-
-    for content, target in materialized:
-        if basename_counts.get(target.name) != 1:
-            continue
-        alias = entry_parent / target.name
-        if alias.exists():
-            continue
-        alias.write_text(content, encoding="utf-8")
+        target.write_bytes(content.encode("utf-8"))
     return entry_parent, rewritten
 
 
@@ -4480,14 +4842,23 @@ def _run_preprocessor_with_snapshot(
             # Entry text supplied separately from the snapshot map — apply
             # the same absolute-include redirection to it.
             target_by_norm = {}
-            for fname in files:
+            _entry_parent, targets = _execution_workspace_targets(
+                entry_file,
+                files,
+                tmp_root,
+            )
+            for fname, target in targets.items():
                 key = _strip_include_instance_suffix(fname)
                 try:
                     norm_key = os.path.normcase(os.path.abspath(key))
                 except (OSError, ValueError):
                     continue
-                target_by_norm[norm_key] = str(tmp_root / Path(key).name)
-            entry_text = rewrite_supplied_absolute_includes(mod_text, target_by_norm)
+                target_by_norm[norm_key] = str(target)
+            entry_text = _rewrite_snapshot_includepaths(
+                rewrite_supplied_absolute_includes(mod_text, target_by_norm),
+                entry_file,
+                targets,
+            )
         return run_preprocessor(
             entry_text,
             preprocessor_path,
@@ -4528,13 +4899,26 @@ def _run_anchor_range(model) -> DRange:
     return DRange(DPos(0, 0), DPos(0, 1))
 
 
-def _set_run_diagnostics(uri: str, diags: List[DDiag]) -> None:
+def _set_run_diagnostics(
+    uri: str,
+    diags: List[DDiag],
+    expected_generation: Optional[int] = None,
+) -> bool:
     with _state_lock:
+        current_generation = _document_generations.get(uri, 0)
+        generation = (
+            current_generation
+            if expected_generation is None
+            else expected_generation
+        )
+        if generation != current_generation:
+            return False
         if diags:
             _document_run_diagnostics[uri] = diags
         else:
             _document_run_diagnostics.pop(uri, None)
-    _publish_all_diagnostics(uri)
+    _publish_all_diagnostics(uri, generation)
+    return True
 
 
 def _show_message(message_type: "lsp.MessageType", message: str) -> None:
@@ -4566,12 +4950,25 @@ def run_preprocessor_command(*args):
     text = _command_document_text(uri)
     if text is None:
         return {"success": False, "message": "Document not available"}
-    (
-        entry_uri,
-        preprocessor_source,
-        _source_dir,
-        active_include_uri,
-    ) = _preprocessor_scope_for_uri(uri, text)
+    with _state_lock:
+        command_generation = _document_generations.get(uri, 0)
+    try:
+        (
+            entry_uri,
+            preprocessor_source,
+            _source_dir,
+            active_include_uri,
+        ) = _preprocessor_scope_for_uri(uri, text)
+    except _AmbiguousPreprocessorContextError as exc:
+        _show_message(lsp.MessageType.Info, str(exc))
+        return {
+            "success": False,
+            "message": str(exc),
+            "exit_code": None,
+            "diagnostics": [],
+            "raw_stdout": "",
+            "raw_stderr": "",
+        }
     preprocessor_files = _workspace_files_for_execution(entry_uri, preprocessor_source)
     preprocessor_active_file = _execution_file_key(entry_uri)
 
@@ -4610,11 +5007,15 @@ def run_preprocessor_command(*args):
     # _state_lock itself.)
     snapshot_current = _execution_snapshot_is_current(preprocessor_files)
     with _state_lock:
-        fresh = _document_models.get(uri) is not None and snapshot_current
+        fresh = (
+            _document_models.get(uri) is not None
+            and _document_generations.get(uri, 0) == command_generation
+            and snapshot_current
+        )
         if fresh:
             _document_preprocessor_results[uri] = result
     if fresh:
-        _publish_all_diagnostics(uri)
+        _publish_all_diagnostics(uri, command_generation)
     else:
         _show_message(
             lsp.MessageType.Info,
@@ -4657,12 +5058,22 @@ def run_dynare_command(*args):
     text = _command_document_text(uri)
     if text is None:
         return {"success": False, "message": "Document not available"}
-    (
-        entry_uri,
-        run_source,
-        _source_dir,
-        _active_include_uri,
-    ) = _preprocessor_scope_for_uri(uri, text)
+    with _state_lock:
+        command_generation = _document_generations.get(uri, 0)
+    try:
+        (
+            entry_uri,
+            run_source,
+            _source_dir,
+            _active_include_uri,
+        ) = _preprocessor_scope_for_uri(uri, text)
+    except _AmbiguousPreprocessorContextError as exc:
+        _show_message(lsp.MessageType.Info, str(exc))
+        return {
+            "success": False,
+            "status": "ambiguous_context",
+            "message": str(exc),
+        }
     run_files = _workspace_files_for_execution(entry_uri, run_source)
     run_active_file = _execution_file_key(entry_uri)
 
@@ -4690,7 +5101,7 @@ def run_dynare_command(*args):
     # An unavailable toolchain is an environment issue, not a model error:
     # report it but do not leave diagnostics on the file.
     if not result.get("matlab_available") or not result.get("dynare_available"):
-        _set_run_diagnostics(uri, [])
+        _set_run_diagnostics(uri, [], command_generation)
         _show_message(
             lsp.MessageType.Info,
             f"Dynare run skipped: {result.get('message', 'toolchain unavailable')}",
@@ -4720,7 +5131,12 @@ def run_dynare_command(*args):
                 code="DYNR",
             )
         )
-    _set_run_diagnostics(uri, diags)
+    if not _set_run_diagnostics(uri, diags, command_generation):
+        _show_message(
+            lsp.MessageType.Info,
+            "Dynare run discarded: a newer document version is active.",
+        )
+        return result
 
     if result.get("success") and not diags:
         steady = result.get("steady_state") or {}
@@ -6536,6 +6952,68 @@ _FUNCTION_SIGNATURES = {
 }
 
 
+def _signature_code_prefix(text: str, end: int) -> Optional[str]:
+    """Return the current executable line prefix, or none inside non-code."""
+    prefix = text[: max(0, min(end, len(text)))]
+    masked = list(prefix)
+    state = "code"
+    quote = ""
+    index = 0
+    while index < len(prefix):
+        char = prefix[index]
+        next_char = prefix[index + 1] if index + 1 < len(prefix) else ""
+        if state == "code":
+            if char in {"'", '"'}:
+                state = "string"
+                quote = char
+                masked[index] = " "
+            elif char == "%":
+                state = "line_comment"
+                masked[index] = " "
+            elif char == "/" and next_char == "/":
+                state = "line_comment"
+                masked[index] = " "
+                masked[index + 1] = " "
+                index += 1
+            elif char == "/" and next_char == "*":
+                state = "block_comment"
+                masked[index] = " "
+                masked[index + 1] = " "
+                index += 1
+        elif state == "line_comment":
+            if char in {"\r", "\n"}:
+                state = "code"
+            else:
+                masked[index] = " "
+        elif state == "block_comment":
+            if char == "*" and next_char == "/":
+                masked[index] = " "
+                masked[index + 1] = " "
+                state = "code"
+                index += 1
+            elif char not in {"\r", "\n"}:
+                masked[index] = " "
+        else:
+            if char in {"\r", "\n"}:
+                state = "code"
+            else:
+                masked[index] = " "
+                if char == "\\" and next_char:
+                    masked[index + 1] = " "
+                    index += 1
+                elif char == quote:
+                    if next_char == quote:
+                        masked[index + 1] = " "
+                        index += 1
+                    else:
+                        state = "code"
+        index += 1
+
+    if state != "code":
+        return None
+    return "".join(masked).rsplit("\n", 1)[-1]
+
+
 @server.feature(
     lsp.TEXT_DOCUMENT_SIGNATURE_HELP,
     lsp.SignatureHelpOptions(trigger_characters=["(", ","]),
@@ -6549,9 +7027,14 @@ def signature_help(
     lines = doc.source.split("\n")
     if params.position.line >= len(lines):
         return None
-    line = lines[params.position.line]
     source_pos = _lsp_position_to_source_position(lines, params.position)
-    before = line[: source_pos.character]
+    absolute_offset = sum(len(previous) + 1 for previous in lines[: source_pos.line])
+    before = _signature_code_prefix(
+        doc.source,
+        absolute_offset + source_pos.character,
+    )
+    if before is None:
+        return None
 
     # Walk back to find the most recent unclosed `name(` and the args so far
     m = re.search(r"([A-Za-z_][A-Za-z_0-9]*)\s*\(([^()]*)$", before)
@@ -7532,8 +8015,18 @@ def compare_models_command(*args) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _preload_solver_runtime() -> None:
+    """Load native solver dependencies before protocol worker threads start."""
+    try:
+        import numpy  # noqa: F401
+        import scipy.optimize  # noqa: F401
+    except ImportError:
+        pass
+
+
 def start_server(host: str = "127.0.0.1", port: int = 0, stdio: bool = True) -> None:
     """Start the language server."""
+    _preload_solver_runtime()
     if stdio:
         server.start_io()
     else:

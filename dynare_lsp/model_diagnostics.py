@@ -19,6 +19,8 @@ an intentionally nonstationary model is not mistaken for a modelling error.
 
 from __future__ import annotations
 
+from copy import copy
+from dataclasses import replace
 from typing import List
 
 from .bk_check import _compute_jacobian
@@ -27,8 +29,8 @@ from .parser import ParsedModel, Position, SourceRange
 
 
 MODEL_DIAGNOSTICS_CODE = "W080"
-# Residual below which a reduced index set is accepted as a valid collinear
-# relation (matches the 1e-6 acceptance test in model_diagnostics.m).
+# Relative residual below which a reduced index set is accepted as a valid
+# collinear relation (matches the 1e-6 acceptance test in model_diagnostics.m).
 _VERIFY_TOL = 1e-6
 
 
@@ -69,11 +71,39 @@ def _minimal_relation(matrix, vector, np) -> List[int]:
             continue
         last_k = k
         residual = matrix[:, k] @ vector[k]
-        if residual.size == 0 or float(np.max(np.abs(residual))) < _VERIFY_TOL:
+        if residual.size == 0:
+            break
+        residual_norm = float(np.max(np.abs(residual)))
+        contribution_scale = np.abs(matrix[:, k]) @ np.abs(vector[k])
+        relation_scale = float(np.max(contribution_scale))
+        if residual_norm <= _VERIFY_TOL * relation_scale:
             break
     if not last_k:
         last_k = [i for i, weight in enumerate(vector) if abs(weight) > 0.0]
     return sorted(last_k)
+
+
+def _static_jacobian_model(model: ParsedModel) -> ParsedModel:
+    """Project tagged equation pairs onto Dynare's static equation system.
+
+    ``_compute_jacobian`` intentionally uses dynamic equations for BK checks.
+    Model diagnostics need the complementary projection: regular equations plus
+    ``[static]`` replacements, with their tags removed so the shared Jacobian
+    builder evaluates them as ordinary equations.
+    """
+    static_equation_ids = {id(eq) for eq in model.static_model_equations()}
+    projected = copy(model)
+    projected.model_equations = [
+        replace(
+            equation,
+            tags=[
+                tag for tag in equation.tags if tag.lower() not in {"static", "dynamic"}
+            ],
+        )
+        for equation in model.model_equations
+        if equation.text.strip().startswith("#") or id(equation) in static_equation_ids
+    ]
+    return projected
 
 
 def _equation_label(equations, eq_index_zero_based: int) -> str:
@@ -133,13 +163,14 @@ def check_model_diagnostics(
         return []
 
     endogenous = list(model.endogenous)
-    equations = model.dynamic_model_equations()
+    equations = model.static_model_equations()
     n_endo = len(endogenous)
     if n_endo == 0 or len(equations) != n_endo:
         return []
 
     try:
-        f_yp, f_y0, f_ym = _compute_jacobian(model, ss_values)
+        jacobian_model = _static_jacobian_model(model)
+        f_yp, f_y0, f_ym = _compute_jacobian(jacobian_model, ss_values)
     except Exception:
         return []
 
@@ -156,7 +187,9 @@ def check_model_diagnostics(
 
         # Left null space (collinear equations) from the transpose.
         _eq_rank, eq_vectors = _rank_and_null_space(
-            steady_state_jacobian.T, np, tol,
+            steady_state_jacobian.T,
+            np,
+            tol,
         )
 
         variable_names = [var.name for var in endogenous]
@@ -165,9 +198,7 @@ def check_model_diagnostics(
         for vector in var_vectors:
             indices = _minimal_relation(steady_state_jacobian, vector, np)
             names = [
-                variable_names[idx]
-                for idx in indices
-                if 0 <= idx < len(variable_names)
+                variable_names[idx] for idx in indices if 0 <= idx < len(variable_names)
             ]
             if names:
                 variable_relations.append(names)
@@ -206,15 +237,18 @@ def check_model_diagnostics(
 
         message = " ".join(parts) + _unit_root_note(model, ss_values)
 
-        return [Diagnostic(
-            range=model.model_block_range or SourceRange(
-                Position(0, 0),
-                Position(0, 1),
-            ),
-            severity=Severity.WARNING,
-            message=message,
-            source="dynare",
-            code=MODEL_DIAGNOSTICS_CODE,
-        )]
+        return [
+            Diagnostic(
+                range=model.model_block_range
+                or SourceRange(
+                    Position(0, 0),
+                    Position(0, 1),
+                ),
+                severity=Severity.WARNING,
+                message=message,
+                source="dynare",
+                code=MODEL_DIAGNOSTICS_CODE,
+            )
+        ]
     except Exception:
         return []

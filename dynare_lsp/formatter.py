@@ -83,12 +83,31 @@ _CANONICAL_TOKEN_RE = re.compile(
 # capture the glue even though ``_strip_comments`` blanks ``@{...}`` content.
 _INTERP_ATOM_RE = re.compile(r"\w*(?:@\{[^}\n]*\}\w*)+")
 
+_LINE_BREAK_RE = re.compile(r"\r\n|\r|\n")
+
+
+def _line_ending(text: str) -> str:
+    """Return the document's line-ending convention."""
+    match = _LINE_BREAK_RE.search(text)
+    return match.group() if match is not None else "\n"
+
+
+def _normalise_line_breaks(text: str) -> str:
+    """Give comment parsing LF-delimited logical lines on every platform."""
+    return _LINE_BREAK_RE.sub("\n", text)
+
+
+def _structural_line(text: str) -> str:
+    """Ignore a leading UTF-8 BOM when matching Dynare block syntax."""
+    return text.removeprefix("\ufeff")
+
 
 def _canonical(text: str) -> str:
     """Comment/macro-blanked token stream (the whitespace-only invariant key),
     plus the glued interpolation atoms from the raw text."""
-    tokens = _CANONICAL_TOKEN_RE.findall(_strip_comments(text))
-    interp_atoms = _INTERP_ATOM_RE.findall(text)
+    normalised = _normalise_line_breaks(text)
+    tokens = _CANONICAL_TOKEN_RE.findall(_strip_comments(normalised))
+    interp_atoms = _INTERP_ATOM_RE.findall(normalised)
     return "\x00".join(tokens) + "\x01" + "\x00".join(interp_atoms)
 
 
@@ -112,9 +131,9 @@ def _reformat(text: str, indent_unit: str) -> str:
     # Preserve the file's line-ending convention: the per-line strips below
     # drop every "\r", so a plain "\n" join would silently rewrite a CRLF
     # file wholesale (pure diff noise in the editor).
-    eol = "\r\n" if "\r\n" in text else "\n"
-    orig_lines = [line.rstrip("\r") for line in text.split("\n")]
-    stripped_lines = [line.rstrip("\r") for line in _strip_comments(text).split("\n")]
+    eol = _line_ending(text)
+    orig_lines = _LINE_BREAK_RE.split(text)
+    stripped_lines = _strip_comments(_normalise_line_breaks(text)).split("\n")
     out = _format_lines(orig_lines, stripped_lines, indent_unit, 0)
     while out and out[-1] == "":
         out.pop()
@@ -125,9 +144,10 @@ def _depth_before(stripped_lines: List[str], upto: int) -> int:
     """Block-nesting depth after the lines ``[0, upto)`` (openers +1, ``end;`` -1)."""
     depth = 0
     for stripped in stripped_lines[:upto]:
-        if _END_RE.fullmatch(stripped):
+        structural = _structural_line(stripped)
+        if _END_RE.fullmatch(structural):
             depth = max(0, depth - 1)
-        elif _OPENER_RE.fullmatch(stripped):
+        elif _OPENER_RE.fullmatch(structural):
             depth += 1
     return depth
 
@@ -155,6 +175,7 @@ def _format_lines(
 
     for orig, stripped in zip(orig_lines, stripped_lines):
         code = stripped.rstrip()
+        structural = _structural_line(stripped)
 
         if code.strip() == "":
             # No code on this line: blank, comment-only, or macro directive.
@@ -167,7 +188,7 @@ def _format_lines(
                 out.append(orig.rstrip())  # comment / @# line, verbatim content
             continue
 
-        if _END_RE.fullmatch(stripped):
+        if _END_RE.fullmatch(structural):
             _flush_run()
             depth = max(0, depth - 1)
             out.append(indent_unit * depth + orig.strip())
@@ -185,7 +206,7 @@ def _format_lines(
             # expanded token (``e_xi 7``), so keep the line verbatim.
             _flush_run()
             out.append(indent + orig.strip())
-            if _OPENER_RE.fullmatch(stripped):
+            if _OPENER_RE.fullmatch(structural):
                 depth += 1
             continue
 
@@ -209,12 +230,12 @@ def _format_lines(
             if spaced is not None and not trailing
             else None
         )
-        if match and not _OPENER_RE.fullmatch(stripped):
+        if match and not _OPENER_RE.fullmatch(structural):
             assign_run.append((line_index, match.group(1), match.group(2)))
         else:
             _flush_run()
 
-        if _OPENER_RE.fullmatch(stripped):
+        if _OPENER_RE.fullmatch(structural):
             depth += 1
 
     _flush_run()

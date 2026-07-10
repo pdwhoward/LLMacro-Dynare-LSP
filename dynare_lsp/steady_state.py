@@ -27,6 +27,7 @@ from .parser import (
     ParsedModel,
     SourceRange,
     _mask_string_literals,
+    _offset_to_position,
     _strip_comments,
     _strip_equation_tags_from_text,
 )
@@ -1065,9 +1066,10 @@ def _evaluate_equation(
 
     residual = lhs_val - rhs_val
 
-    # Use relative tolerance for large values
-    scale = max(abs(lhs_val), abs(rhs_val), 1.0)
-    is_satisfied = abs(residual) / scale < tolerance
+    # Dynare's solve_tolf is an absolute residual tolerance.  Relative scaling
+    # can otherwise accept a materially wrong equation solely because both
+    # sides happen to be large.
+    is_satisfied = abs(residual) < tolerance
 
     return SteadyStateResult(
         equation=eq,
@@ -1198,6 +1200,33 @@ def _command_scan_text(model: ParsedModel) -> str:
     return _mask_string_literals(_strip_comments(model.text or ""))
 
 
+def _initval_is_followed_by_steady(model: ParsedModel) -> bool:
+    """Return whether the latest ``initval`` feeds a later ``steady`` call.
+
+    In that ordering Dynare uses the ``initval`` values as starting guesses for
+    its nonlinear steady-state solver.  They are not themselves a candidate
+    steady state, so validating them before the solver runs produces false
+    residual warnings.
+    """
+    if not model.initval_entries:
+        return False
+
+    last_entry = max(
+        (entry.range.end.line, entry.range.end.character)
+        for entry in model.initval_entries
+    )
+    command_text = _command_scan_text(model)
+    for match in re.finditer(
+        r"(?<!\w)steady\s*(?:\([^;\)]*\))?\s*;",
+        command_text,
+        re.IGNORECASE,
+    ):
+        position = _offset_to_position(command_text, match.start())
+        if (position.line, position.character) > last_entry:
+            return True
+    return False
+
+
 def _is_deterministic_transition(model: ParsedModel) -> bool:
     """A perfect-foresight / deterministic model supplies ``initval`` as the
     INITIAL CONDITION of a transition path (deliberately off the steady state)
@@ -1255,15 +1284,19 @@ def validate_steady_state(
             model,
             param_overrides=param_overrides,
         )
-    elif model.initval_entries and not _is_deterministic_transition(model):
+    elif (
+        model.initval_entries
+        and not _is_deterministic_transition(model)
+        and not _initval_is_followed_by_steady(model)
+    ):
         values, value_errors = _compute_ss_values_from_initval(
             model,
             param_overrides=param_overrides,
         )
     else:
-        # No steady-state block, and either no initval or a deterministic
-        # (perfect-foresight) model whose initval is a transition start rather
-        # than a steady state -- there is nothing to validate as a steady state.
+        # No explicit steady-state block, and either no initval, a deterministic
+        # transition, or a later steady command that consumes initval as solver
+        # guesses. There is nothing to validate as an already-computed state.
         return None
 
     exogenous = model.exogenous_names()

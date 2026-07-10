@@ -40,6 +40,8 @@ const vscode = __importStar(require("vscode"));
 const vscode_1 = require("vscode");
 const node_1 = require("vscode-languageclient/node");
 let client;
+let clientStartPromise;
+let clientGeneration = 0;
 let currentPythonPath = "python";
 function configuredPythonPath() {
     const config = vscode_1.workspace.getConfiguration("dynare");
@@ -57,8 +59,13 @@ function resolveSearchPath(entry, workspaceFolder) {
 }
 function configuredSearchPaths() {
     const config = vscode_1.workspace.getConfiguration("dynare");
-    const resolved = config.get("searchPaths", []).map((entry) => resolveSearchPath(entry));
-    return Array.from(new Set(resolved));
+    // Relative entries belong only in searchPathsByRoot, where each workspace
+    // folder resolves them against itself instead of leaking them across roots.
+    const absolute = config
+        .get("searchPaths", [])
+        .map((entry) => entry.trim())
+        .filter((entry) => entry.length > 0 && path.isAbsolute(entry));
+    return Array.from(new Set(absolute));
 }
 function configuredSearchPathsByRoot() {
     const workspaceFolders = vscode_1.workspace.workspaceFolders;
@@ -89,13 +96,20 @@ function dynareConfigurationPayload() {
         },
     };
 }
-async function pushDynareConfiguration() {
-    if (!client || !client.isRunning()) {
+async function pushDynareConfiguration(targetClient = client) {
+    if (!targetClient || targetClient !== client || !targetClient.isRunning()) {
         return;
     }
-    await client.sendNotification("workspace/didChangeConfiguration", {
-        settings: dynareConfigurationPayload(),
-    });
+    try {
+        await targetClient.sendNotification("workspace/didChangeConfiguration", {
+            settings: dynareConfigurationPayload(),
+        });
+    }
+    catch (err) {
+        if (targetClient === client) {
+            console.error("Failed to send Dynare language server configuration", err);
+        }
+    }
 }
 function createClient(pythonPath) {
     const serverOptions = {
@@ -113,19 +127,79 @@ function createClient(pythonPath) {
     };
     return new node_1.LanguageClient("dynareLSP", "Dynare Language Server", serverOptions, clientOptions);
 }
+async function stopClient(targetClient) {
+    if (!targetClient.isRunning()) {
+        return;
+    }
+    try {
+        await targetClient.stop();
+    }
+    catch (err) {
+        console.warn("Failed to stop Dynare language client", err);
+    }
+}
 function startClient(context, pythonPath) {
+    const generation = ++clientGeneration;
     currentPythonPath = pythonPath;
-    client = createClient(pythonPath);
-    context.subscriptions.push(client);
-    void client.start().then(() => pushDynareConfiguration(), (err) => {
-        // A failed start (e.g. wrong dynare.pythonPath) leaves the client in
-        // the startFailed state; the LanguageClient surfaces its own error UI,
-        // so just log here instead of leaking an unhandled rejection.
-        console.error("Dynare language server failed to start", err);
+    const previousClient = client;
+    const previousStart = clientStartPromise;
+    // LanguageClient cannot stop while Starting. Let an older generation settle
+    // and clean itself up before the newest generation creates another client.
+    const lifecycle = (async () => {
+        if (previousStart) {
+            await previousStart;
+        }
+        if (generation !== clientGeneration) {
+            return;
+        }
+        if (previousClient && client === previousClient) {
+            await stopClient(previousClient);
+            if (client === previousClient) {
+                client = undefined;
+            }
+        }
+        if (generation !== clientGeneration) {
+            return;
+        }
+        const nextClient = createClient(pythonPath);
+        client = nextClient;
+        context.subscriptions.push(nextClient);
+        try {
+            await nextClient.start();
+        }
+        catch (err) {
+            if (client === nextClient) {
+                client = undefined;
+            }
+            console.error("Dynare language server failed to start", err);
+            return;
+        }
+        if (generation !== clientGeneration || client !== nextClient) {
+            await stopClient(nextClient);
+            if (client === nextClient) {
+                client = undefined;
+            }
+            return;
+        }
+        await pushDynareConfiguration(nextClient);
+    })();
+    let trackedStart;
+    trackedStart = lifecycle
+        .catch((err) => {
+        console.error("Dynare language client lifecycle failed", err);
+    })
+        .finally(() => {
+        if (clientStartPromise === trackedStart) {
+            clientStartPromise = undefined;
+        }
     });
+    clientStartPromise = trackedStart;
 }
 function maybeStartClientForDocument(context, document) {
-    if (client || !document || document.languageId !== "dynare") {
+    if (client ||
+        clientStartPromise ||
+        !document ||
+        document.languageId !== "dynare") {
         return;
     }
     startClient(context, configuredPythonPath());
@@ -136,19 +210,9 @@ function maybeStartClientForOpenDynareDocument(context) {
 }
 async function restartClient(context) {
     const nextPythonPath = configuredPythonPath();
-    if (nextPythonPath === currentPythonPath) {
+    if (nextPythonPath === currentPythonPath &&
+        (client !== undefined || clientStartPromise !== undefined)) {
         return false;
-    }
-    if (client) {
-        try {
-            await client.stop();
-        }
-        catch (err) {
-            // stop() throws for any state other than Running (notably
-            // startFailed — exactly the state a corrected dynare.pythonPath is
-            // meant to recover from). Discard the old client and start fresh.
-            console.warn("Discarding Dynare language client that was not running", err);
-        }
     }
     startClient(context, nextPythonPath);
     return true;
@@ -196,7 +260,8 @@ function activate(context) {
         maybeStartClientForDocument(context, document);
     }), vscode_1.workspace.onDidChangeConfiguration((event) => {
         if (event.affectsConfiguration("dynare.pythonPath")) {
-            if (!client) {
+            if (!client && !clientStartPromise) {
+                maybeStartClientForOpenDynareDocument(context);
                 return;
             }
             void (async () => {
@@ -215,17 +280,21 @@ function activate(context) {
     }));
 }
 function deactivate() {
-    if (!client) {
+    const activeClient = client;
+    const pendingStart = clientStartPromise;
+    clientGeneration += 1;
+    client = undefined;
+    clientStartPromise = undefined;
+    if (!activeClient && !pendingStart) {
         return undefined;
     }
-    // stop() throws (or rejects) for any state other than Running — e.g.
-    // startFailed after a bad dynare.pythonPath. Swallow it so extension-host
-    // shutdown never sees an unhandled rejection from us.
-    try {
-        return client.stop().then(undefined, () => undefined);
-    }
-    catch {
-        return undefined;
-    }
+    return (async () => {
+        if (pendingStart) {
+            await pendingStart;
+        }
+        if (activeClient) {
+            await stopClient(activeClient);
+        }
+    })();
 }
 //# sourceMappingURL=extension.js.map

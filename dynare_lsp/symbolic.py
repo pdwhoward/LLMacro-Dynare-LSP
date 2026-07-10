@@ -86,7 +86,6 @@ if _HAS_SYMPY:
         "erfc": sympy.erfc,
     }
     _DYNARE_TO_SYMPY_CONSTANTS = {
-        "pi": sympy.pi,
         "inf": sympy.oo,
     }
 
@@ -147,14 +146,15 @@ def _dynare_expr_to_sympy(
 
     # Escape Python-reserved identifiers in the expression text itself.
     import re as _re
-    escape_names = (
-        set(param_symbols) | set(var_symbols) | set(local_var_exprs)
-    )
+
+    escape_names = set(param_symbols) | set(var_symbols) | set(local_var_exprs)
     for name in escape_names:
         esc = _escape_reserved(name)
         if esc != name:
             expr_text = _re.sub(
-                r"\b" + _re.escape(name) + r"\b", esc, expr_text,
+                r"\b" + _re.escape(name) + r"\b",
+                esc,
+                expr_text,
             )
     if _re.search(r"""['"]""", expr_text):
         raise ValueError("String literals are not supported in symbolic expressions")
@@ -188,11 +188,16 @@ def _dynare_expr_to_sympy(
         ):
             raise ValueError("Container expressions are not supported symbolically")
         if isinstance(node, _ast.Constant) and isinstance(node.value, str):
-            raise ValueError("String literals are not supported in symbolic expressions")
+            raise ValueError(
+                "String literals are not supported in symbolic expressions"
+            )
         if isinstance(node, _ast.Name) and node.id.startswith("__"):
             raise ValueError("Private Python names are not supported symbolically")
         if isinstance(node, _ast.Call):
-            if not isinstance(node.func, _ast.Name) or node.func.id not in allowed_calls:
+            if (
+                not isinstance(node.func, _ast.Name)
+                or node.func.id not in allowed_calls
+            ):
                 raise ValueError(
                     "Only Dynare math functions are supported in symbolic expressions"
                 )
@@ -230,9 +235,12 @@ def _prepare_sympy_system(
     param_symbols = {name: Symbol(name) for name in param_values}
 
     # Substitute parameter numerical values
-    param_subs = {param_symbols[k]: sympy.Rational(v).limit_denominator(10**12)
-                  if v == int(v) else sympy.Float(v, 15)
-                  for k, v in param_values.items()}
+    param_subs = {
+        param_symbols[k]: sympy.Rational(v).limit_denominator(10**12)
+        if v == int(v)
+        else sympy.Float(v, 15)
+        for k, v in param_values.items()
+    }
 
     # Process local variable definitions first
     local_var_exprs: Dict[str, Any] = {}
@@ -535,6 +543,7 @@ def reduce_symbolically(
 
     if param_values is None:
         from .solver import _effective_param_values
+
         param_values = _effective_param_values(model)
 
     var_names = [v.name for v in model.endogenous]
@@ -576,9 +585,11 @@ def reduce_symbolically(
 
     solved: Dict[str, Any] = {}  # var_name -> sympy expression
     remaining_eqs = list(residuals)
-    remaining_eq_texts = list(eq_texts) if len(eq_texts) == len(residuals) else [
-        str(r) for r in residuals
-    ]
+    remaining_eq_texts = (
+        list(eq_texts)
+        if len(eq_texts) == len(residuals)
+        else [str(r) for r in residuals]
+    )
     remaining_vars = set(var_names)
 
     # Phase 2 + 3: Iterative forward substitution
@@ -601,8 +612,9 @@ def reduce_symbolically(
             eq = remaining_eqs[i]
 
             # Substitute all solved vars
-            subs_dict = {var_symbols[n]: v for n, v in solved.items()
-                         if n in var_symbols}
+            subs_dict = {
+                var_symbols[n]: v for n, v in solved.items() if n in var_symbols
+            }
             eq_sub = eq.subs(subs_dict)
 
             # Note: avoid sympy.simplify/expand -- too slow for DSGE models
@@ -610,8 +622,9 @@ def reduce_symbolically(
 
             # What unsolved vars remain?
             free = eq_sub.free_symbols & all_var_syms
-            unsolved_in_eq = {sym_to_name[s] for s in free
-                              if sym_to_name.get(s) in remaining_vars}
+            unsolved_in_eq = {
+                sym_to_name[s] for s in free if sym_to_name.get(s) in remaining_vars
+            }
 
             if len(unsolved_in_eq) == 0:
                 # Equation is fully determined -- check if it's satisfied
@@ -646,7 +659,8 @@ def reduce_symbolically(
 
                         preferred = (
                             preferred_values.get(var_name)
-                            if preferred_values is not None else None
+                            if preferred_values is not None
+                            else None
                         )
                         sol = _select_best_solution(
                             solutions,
@@ -663,8 +677,7 @@ def reduce_symbolically(
                             else:
                                 eq_label = str(eq_sub)[:60]
                             steps.append(
-                                f"Solved {var_name} = {sol} "
-                                f"(from: {eq_label[:80]})"
+                                f"Solved {var_name} = {sol} (from: {eq_label[:80]})"
                             )
                             changed = True
                             continue
@@ -690,13 +703,15 @@ def reduce_symbolically(
                 if _past(deadline):
                     break
                 eq = remaining_eqs[i]
-                subs_dict = {var_symbols[n]: v for n, v in solved.items()
-                             if n in var_symbols}
+                subs_dict = {
+                    var_symbols[n]: v for n, v in solved.items() if n in var_symbols
+                }
                 eq_sub = eq.subs(subs_dict)
 
                 free = eq_sub.free_symbols & all_var_syms
-                unsolved_in_eq = {sym_to_name[s] for s in free
-                                  if sym_to_name.get(s) in remaining_vars}
+                unsolved_in_eq = {
+                    sym_to_name[s] for s in free if sym_to_name.get(s) in remaining_vars
+                }
 
                 if len(unsolved_in_eq) == 0:
                     # Fully determined after substitution
@@ -720,12 +735,17 @@ def reduce_symbolically(
                         if solutions:
                             preferred = (
                                 preferred_values.get(var_name)
-                                if preferred_values is not None else None
+                                if preferred_values is not None
+                                else None
                             )
                             sol = _select_best_solution(
-                                solutions, var_sym,
-                                {var_symbols[n]: v for n, v in solved.items()
-                                 if n in var_symbols},
+                                solutions,
+                                var_sym,
+                                {
+                                    var_symbols[n]: v
+                                    for n, v in solved.items()
+                                    if n in var_symbols
+                                },
                                 preferred,
                             )
                             if sol is not None:
@@ -792,18 +812,17 @@ def reduce_symbolically(
     # Phase 4: SCC block solving for remaining coupled equations
     if remaining_vars and remaining_eqs:
         # Substitute solved vars into remaining equations
-        subs_dict = {var_symbols[n]: v for n, v in solved.items()
-                     if n in var_symbols}
+        subs_dict = {var_symbols[n]: v for n, v in solved.items() if n in var_symbols}
         remaining_eqs = [eq.subs(subs_dict) for eq in remaining_eqs]
 
         # Build dependency graph on remaining vars/equations
-        remaining_var_syms = {n: var_symbols[n] for n in remaining_vars
-                              if n in var_symbols}
+        remaining_var_syms = {
+            n: var_symbols[n] for n in remaining_vars if n in var_symbols
+        }
         adj = _build_dependency_graph(remaining_eqs, remaining_var_syms)
 
         # Filter adjacency to only remaining vars
-        adj = {k: v & remaining_vars for k, v in adj.items()
-               if k in remaining_vars}
+        adj = {k: v & remaining_vars for k, v in adj.items() if k in remaining_vars}
 
         sccs = _tarjan_scc(adj)
         sccs = _topological_sort_sccs(sccs, adj)
@@ -818,8 +837,11 @@ def reduce_symbolically(
 
             for idx, eq in enumerate(remaining_eqs):
                 eq_free = eq.free_symbols & all_var_syms
-                eq_vars = {sym_to_name[s] for s in eq_free
-                           if sym_to_name.get(s) in remaining_vars}
+                eq_vars = {
+                    sym_to_name[s]
+                    for s in eq_free
+                    if sym_to_name.get(s) in remaining_vars
+                }
                 if eq_vars & set(scc):
                     scc_eqs.append(eq)
                     scc_eq_indices.append(idx)
@@ -828,8 +850,7 @@ def reduce_symbolically(
             # on nonlinear DSGE equations with fractional exponents
             if len(scc) == 1 and len(scc_eqs) >= 1:
                 try:
-                    scc_var_syms = [var_symbols[n] for n in scc
-                                    if n in var_symbols]
+                    scc_var_syms = [var_symbols[n] for n in scc if n in var_symbols]
                     solve_eqs = scc_eqs[: len(scc)]
                     solutions = sympy.solve(solve_eqs, scc_var_syms, dict=True)
 
@@ -880,7 +901,9 @@ def reduce_symbolically(
                 val = expr.subs(eval_subs)
                 free = val.free_symbols & all_var_syms
                 remaining_free = {sym_to_name.get(s) for s in free} & remaining_vars
-                if not remaining_free and not (val.free_symbols - set(eval_subs.keys())):
+                if not remaining_free and not (
+                    val.free_symbols - set(eval_subs.keys())
+                ):
                     numeric = complex(val.evalf())
                     if abs(numeric.imag) < 1e-10:
                         solved_values[name] = float(numeric.real)
@@ -927,8 +950,10 @@ def reduce_symbolically(
                 # Still depends on another eliminated var (shouldn't happen
                 # after chain resolution, but be safe) -- treat as unsolved
                 remaining_vars.add(name)
-                steps.append(f"WARNING: {name} depends on unresolved vars, "
-                             f"moving to numerical solver")
+                steps.append(
+                    f"WARNING: {name} depends on unresolved vars, "
+                    f"moving to numerical solver"
+                )
             else:
                 eliminated_exprs[name] = expr
                 steps.append(f"Eliminated (chain-resolved): {name} = {expr}")
@@ -938,11 +963,13 @@ def reduce_symbolically(
     elimination_fn = None
     if eliminated_exprs:
         unsolved_var_list = sorted(remaining_vars)
-        unsolved_sym_list = [var_symbols[n] for n in unsolved_var_list
-                             if n in var_symbols]
+        unsolved_sym_list = [
+            var_symbols[n] for n in unsolved_var_list if n in var_symbols
+        ]
         try:
-            elim_exprs_list = [(name, expr) for name, expr in
-                               sorted(eliminated_exprs.items())]
+            elim_exprs_list = [
+                (name, expr) for name, expr in sorted(eliminated_exprs.items())
+            ]
             elim_fns_individual = []
             for name, expr in elim_exprs_list:
                 fn = sympy.lambdify(unsolved_sym_list, expr, modules="numpy")
@@ -970,9 +997,11 @@ def reduce_symbolically(
     unsolved_eq_list = []
 
     if remaining_vars and remaining_eqs:
-        final_subs = {var_symbols[n]: sympy.Float(v, 15)
-                      for n, v in solved_values.items()
-                      if n in var_symbols}
+        final_subs = {
+            var_symbols[n]: sympy.Float(v, 15)
+            for n, v in solved_values.items()
+            if n in var_symbols
+        }
         unsolved_eq_list = [eq.subs(final_subs) for eq in remaining_eqs]
         unsolved_var_list = sorted(remaining_vars)
 
@@ -984,8 +1013,10 @@ def reduce_symbolically(
     n_sym = len(solved_values)
     n_elim = len(eliminated_exprs)
     n_unsolved = len(remaining_vars)
-    steps.append(f"Summary: {n_sym} solved symbolically, {n_elim} eliminated, "
-                 f"{n_unsolved} remaining for numerical solver")
+    steps.append(
+        f"Summary: {n_sym} solved symbolically, {n_elim} eliminated, "
+        f"{n_unsolved} remaining for numerical solver"
+    )
 
     return SymbolicReductionResult(
         solved_vars=dict(solved),
@@ -994,10 +1025,13 @@ def reduce_symbolically(
         unsolved_equations=unsolved_eq_list,
         jacobian_fn=jacobian_fn,
         scc_blocks=_tarjan_scc(
-            _build_dependency_graph(remaining_eqs, {n: var_symbols[n]
-                                                     for n in remaining_vars
-                                                     if n in var_symbols})
-        ) if remaining_vars and remaining_eqs else [],
+            _build_dependency_graph(
+                remaining_eqs,
+                {n: var_symbols[n] for n in remaining_vars if n in var_symbols},
+            )
+        )
+        if remaining_vars and remaining_eqs
+        else [],
         symbolic_steps=steps,
         eliminated_exprs=eliminated_exprs,
         elimination_fn=elimination_fn,

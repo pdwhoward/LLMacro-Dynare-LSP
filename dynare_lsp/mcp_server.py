@@ -31,9 +31,12 @@ broader ``dynare_lsp`` package stays usable for users who don't need MCP.
 
 from __future__ import annotations
 
+import functools
+import math
 import os
 import re
 import sys
+from numbers import Real
 from typing import Any, Dict, List, Optional, Tuple
 
 from .parser import _iter_equation_tag_spans
@@ -57,6 +60,18 @@ _STRING_LITERAL_RE = string_literal
 _MCP_TAG_VALUE_RE = re.compile(r"\bmcp\s*=\s*(['\"])(.*?)\1", re.IGNORECASE)
 _TAG_ATTRIBUTE_KEY_RE = re.compile(r"\b(?:name|mcp)\b(?=\s*=)", re.IGNORECASE)
 _ON_THE_FLY_KIND_MARKERS = frozenset({"e", "x", "p"})
+
+
+def _strict_json_value(value: Any) -> Any:
+    """Return a recursively JSON-safe value with no NaN or infinity tokens."""
+    if isinstance(value, Real) and not isinstance(value, (bool, int)):
+        numeric = float(value)
+        return numeric if math.isfinite(numeric) else None
+    if isinstance(value, dict):
+        return {key: _strict_json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_strict_json_value(item) for item in value]
+    return value
 
 
 def _is_on_the_fly_kind_marker(line: str, start: int, end: int) -> bool:
@@ -294,6 +309,29 @@ def build_server():
 
     mcp = FastMCP("dynare-lsp")
 
+    class _AmbiguousParentContextError(ValueError):
+        pass
+
+    def _tool():
+        """Register a tool whose direct and transported results share strict JSON."""
+
+        def _decorator(fn):
+            @functools.wraps(fn)
+            def _wrapped(*args, **kwargs):
+                try:
+                    result = fn(*args, **kwargs)
+                except _AmbiguousParentContextError as exc:
+                    result = {
+                        "success": False,
+                        "error": "ambiguous_parent_context",
+                        "message": str(exc),
+                    }
+                return _strict_json_value(result)
+
+            return mcp.tool()(_wrapped)
+
+        return _decorator
+
     def _resolve_active_file_key(
         active_file: str,
         files: Dict[str, str],
@@ -320,6 +358,7 @@ def build_server():
 
     def _run_workspace_preprocessor(entry_file: str, files: Dict[str, str]):
         """Run the preprocessor against a temporary mirror of MCP files."""
+        import hashlib
         import os
         import shutil
         import tempfile
@@ -369,10 +408,26 @@ def build_server():
             try:
                 rel = path.relative_to(common_parent)
             except ValueError:
-                rel = Path(path.name)
+                parent_key = os.path.normcase(str(path.parent)).encode("utf-8")
+                parent_id = hashlib.sha256(parent_key).hexdigest()[:16]
+                rel = Path("__external__", parent_id, path.name)
             if rel.is_absolute() or any(part == ".." for part in rel.parts):
-                return Path(path.name)
+                parent_key = os.path.normcase(str(path.parent)).encode("utf-8")
+                parent_id = hashlib.sha256(parent_key).hexdigest()[:16]
+                return Path("__external__", parent_id, path.name)
             return rel
+
+        def _is_bare_virtual_key(fname: str) -> bool:
+            from pathlib import PurePosixPath, PureWindowsPath
+
+            if fname.startswith("file:"):
+                return False
+            if (
+                PureWindowsPath(fname).is_absolute()
+                or PurePosixPath(fname).is_absolute()
+            ):
+                return False
+            return "/" not in fname.replace("\\", "/")
 
         tmp_root = Path(tempfile.mkdtemp(prefix="dynare_lsp_mcp_"))
         try:
@@ -384,8 +439,17 @@ def build_server():
             # supplied (possibly edited) content is silently ignored.
             planned: List[Tuple[str, Path]] = []
             target_by_norm: Dict[str, str] = {}
+            target_owners: Dict[str, str] = {}
             for fname in files:
                 target = tmp_root / _relative_path(fname)
+                target_key = os.path.normcase(str(target))
+                prior = target_owners.get(target_key)
+                if prior is not None and normalized[prior] != normalized[fname]:
+                    raise ValueError(
+                        "workspace files map to the same staged path: "
+                        f"{prior!r} and {fname!r}"
+                    )
+                target_owners[target_key] = fname
                 planned.append((fname, target))
                 target_by_norm[os.path.normcase(str(normalized[fname]))] = str(target)
             rewritten = {
@@ -394,25 +458,27 @@ def build_server():
             }
 
             basename_counts: Dict[str, int] = {}
-            materialized: List[Tuple[str, Path]] = []
+            materialized: List[Tuple[str, str, Path]] = []
             for fname, target in planned:
                 content = rewritten[fname]
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(content, encoding="utf-8")
-                materialized.append((content, target))
+                target.write_text(content, encoding="utf-8", newline="")
+                materialized.append((fname, content, target))
                 basename_counts[target.name] = basename_counts.get(target.name, 0) + 1
 
-            # The workspace resolver accepts unique virtual basename matches
-            # (for example, active "models/main.mod" plus supplied
-            # "helper.mod"). Mirror those aliases so preprocessor
-            # reconciliation sees the same include graph when possible.
-            for content, target in materialized:
+            # A bare virtual key such as "helper.mod" has no caller-supplied
+            # directory, so retain the existing MCP convenience of treating it
+            # as an active-file sibling. Explicitly located files never get this
+            # alias: a missing sibling include must remain missing.
+            for fname, content, target in materialized:
+                if not _is_bare_virtual_key(fname):
+                    continue
                 if basename_counts.get(target.name) != 1:
                     continue
                 alias = entry_parent / target.name
                 if alias.exists():
                     continue
-                alias.write_text(content, encoding="utf-8")
+                alias.write_text(content, encoding="utf-8", newline="")
 
             return run_preprocessor(
                 rewritten[entry_file],
@@ -569,11 +635,15 @@ def build_server():
         index = WorkspaceIndex()
         for fname, content in workspace_files.items():
             index.update_document(fname, content)
-        parent_context, _ambiguous_parents = _select_active_parent_context(
+        parent_context, ambiguous_parents = _select_active_parent_context(
             active_file,
             workspace_files,
             index,
         )
+        if ambiguous_parents:
+            raise _AmbiguousParentContextError(
+                _ambiguous_parent_message(ambiguous_parents)
+            )
         if parent_context is not None:
             model, parent_file, _parent_model, _included_model = parent_context
             if not whole_model:
@@ -830,16 +900,19 @@ def build_server():
 
         return None, [context[1] for context in contexts]
 
-    def _ambiguous_parent_diagnostic(parent_files: List[str]):
+    def _ambiguous_parent_message(parent_files: List[str]) -> str:
         parent_list = ", ".join(sorted(parent_files))
+        return (
+            "Active include is reachable from multiple parent files "
+            f"({parent_list}); rerun with only the intended parent in files "
+            "so include-scoped analysis uses the right model context."
+        )
+
+    def _ambiguous_parent_diagnostic(parent_files: List[str]):
         return Diagnostic(
             range=SourceRange(Position(0, 0), Position(0, 1)),
             severity=Severity.WARNING,
-            message=(
-                "Active include is reachable from multiple parent files "
-                f"({parent_list}); rerun with only the intended parent in "
-                "files so include-scoped diagnostics use the right model context."
-            ),
+            message=_ambiguous_parent_message(parent_files),
             source="dynare",
             code="W061",
         )
@@ -848,7 +921,7 @@ def build_server():
     # Diagnostics
     # -----------------------------------------------------------------------
 
-    @mcp.tool()
+    @_tool()
     def dynare_diagnose(file_content: str) -> List[Dict[str, Any]]:
         """Run the full LLMacro diagnostic suite on a .mod file.
 
@@ -898,7 +971,7 @@ def build_server():
 
         return [_diagnostic_to_dict(d) for d in diagnostics]
 
-    @mcp.tool()
+    @_tool()
     def dynare_diagnose_workspace(
         active_file: str,
         files: Dict[str, str],
@@ -984,7 +1057,7 @@ def build_server():
             diags.append(_ambiguous_parent_diagnostic(ambiguous_parent_files))
         return [_diagnostic_to_dict(d) for d in diags]
 
-    @mcp.tool()
+    @_tool()
     def dynare_auto_fix(file_content: str) -> str:
         """Apply deterministic safe auto-fixes to a .mod file.
 
@@ -1002,7 +1075,7 @@ def build_server():
         """
         return _auto_fix(file_content)
 
-    @mcp.tool()
+    @_tool()
     def dynare_parse_summary(file_content: str) -> Dict[str, Any]:
         """Parse a .mod file and return a structured outline.
 
@@ -1048,7 +1121,7 @@ def build_server():
     # Solver
     # -----------------------------------------------------------------------
 
-    @mcp.tool()
+    @_tool()
     def dynare_compute_steady_state(
         file_content: str,
         active_file: Optional[str] = None,
@@ -1103,7 +1176,7 @@ def build_server():
             "n_numerical": getattr(result, "n_numerical", None),
         }
 
-    @mcp.tool()
+    @_tool()
     def dynare_check_blanchard_kahn(
         file_content: str,
         steady_state: Optional[Dict[str, float]] = None,
@@ -1191,7 +1264,7 @@ def build_server():
     # Symbol queries (analog of LSP textDocument/references and rename)
     # -----------------------------------------------------------------------
 
-    @mcp.tool()
+    @_tool()
     def dynare_find_references(
         file_content: str,
         symbol: str,
@@ -1221,7 +1294,7 @@ def build_server():
             for rng in _single_file_reference_ranges(file_content, symbol)
         ]
 
-    @mcp.tool()
+    @_tool()
     def dynare_rename(
         file_content: str,
         old_name: str,
@@ -1247,9 +1320,9 @@ def build_server():
         if not old_name or not new_name:
             return file_content
         # Dynare's NAME token allows a leading underscore.
-        if not _re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", old_name):
+        if not _re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", old_name):
             return file_content
-        if not _re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", new_name):
+        if not _re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", new_name):
             return file_content
         if _reserved_identifier_reason(old_name) is not None:
             return file_content
@@ -1263,7 +1336,7 @@ def build_server():
             return file_content
         return _rewrite_ranges(file_content, refs, new_name)
 
-    @mcp.tool()
+    @_tool()
     def dynare_find_references_workspace(
         active_file: str,
         symbol: str,
@@ -1289,6 +1362,7 @@ def build_server():
         """
         if not symbol:
             return []
+        files = _rebase_relative_file_keys(active_file, files) or files
         active_file = _resolve_active_file_key(
             active_file,
             files,
@@ -1316,7 +1390,7 @@ def build_server():
             )
         return results
 
-    @mcp.tool()
+    @_tool()
     def dynare_rename_workspace(
         active_file: str,
         old_name: str,
@@ -1342,14 +1416,15 @@ def build_server():
         if not old_name or not new_name:
             return {}
         # Dynare's NAME token allows a leading underscore.
-        if not _re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", old_name):
+        if not _re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", old_name):
             return {}
-        if not _re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", new_name):
+        if not _re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", new_name):
             return {}
         if _reserved_identifier_reason(old_name) is not None:
             return {}
         if _reserved_identifier_reason(new_name) is not None:
             return {}
+        files = _rebase_relative_file_keys(active_file, files) or files
         active_file = _resolve_active_file_key(
             active_file,
             files,
@@ -1393,7 +1468,7 @@ def build_server():
     # Documentation
     # -----------------------------------------------------------------------
 
-    @mcp.tool()
+    @_tool()
     def dynare_explain(code: str) -> str:
         """Return markdown documentation for a diagnostic code.
 
@@ -1413,7 +1488,7 @@ def build_server():
             )
         return rendered
 
-    @mcp.tool()
+    @_tool()
     def dynare_list_diagnostic_codes() -> List[Dict[str, str]]:
         """List every documented diagnostic code with its title.
 
@@ -1439,7 +1514,7 @@ def build_server():
     # Model diff
     # -----------------------------------------------------------------------
 
-    @mcp.tool()
+    @_tool()
     def dynare_compare_models(
         file_content_a: str,
         file_content_b: str,
@@ -1491,7 +1566,7 @@ def build_server():
     # Structure / analysis
     # -----------------------------------------------------------------------
 
-    @mcp.tool()
+    @_tool()
     def dynare_model_info(
         file_content: str,
         active_file: Optional[str] = None,
@@ -1517,7 +1592,7 @@ def build_server():
         )
         return compute_model_info(model)
 
-    @mcp.tool()
+    @_tool()
     def dynare_residuals(
         file_content: str,
         values: Optional[Dict[str, float]] = None,
@@ -1570,7 +1645,12 @@ def build_server():
 
         try:
             residual_fn = _build_residual_function(
-                model, var_names, params, exogenous, {}
+                model,
+                var_names,
+                params,
+                exogenous,
+                {},
+                penalize_invalid=False,
             )
             residual_vec = list(residual_fn(x))
         except Exception as exc:
@@ -1599,7 +1679,7 @@ def build_server():
             "residuals": residuals,
         }
 
-    @mcp.tool()
+    @_tool()
     def dynare_check_identification(
         file_content: str,
         steady_state: Optional[Dict[str, float]] = None,
@@ -1666,7 +1746,7 @@ def build_server():
             "findings": findings,
         }
 
-    @mcp.tool()
+    @_tool()
     def dynare_list_options(command: Optional[str] = None) -> Dict[str, Any]:
         """List the valid options for a Dynare command (anti-hallucination aid).
 
@@ -1728,7 +1808,7 @@ def build_server():
     # Preprocessor execution
     # -----------------------------------------------------------------------
 
-    @mcp.tool()
+    @_tool()
     def dynare_run_preprocessor(
         file_content: str,
         active_file: Optional[str] = None,
@@ -1812,7 +1892,7 @@ def build_server():
     # Full model execution (MATLAB + Dynare)
     # -----------------------------------------------------------------------
 
-    @mcp.tool()
+    @_tool()
     def dynare_run_dynare(
         file_content: str,
         active_file: Optional[str] = None,

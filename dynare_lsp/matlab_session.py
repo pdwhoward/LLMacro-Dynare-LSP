@@ -63,14 +63,38 @@ class DynareSession:
 
     def start(self) -> bool:
         """Launch the session; return True once it signals READY."""
+        if (
+            self._alive()
+            and self.workdir is not None
+            and (self.workdir / "READY").exists()
+        ):
+            return True
+
+        # A prior process may have crashed between runs.  Dispose its log and
+        # workspace before assigning replacement state so neither is leaked.
+        if (
+            self.proc is not None
+            or self.workdir is not None
+            or self._logf is not None
+        ):
+            self.close()
+
         matlab = self._matlab
         dynare = self._dynare
         if not matlab or not dynare or not _SERVER_M.is_file():
             return False
-        self.workdir = Path(tempfile.mkdtemp(prefix="dynare_sess_"))
+        try:
+            self.workdir = Path(tempfile.mkdtemp(prefix="dynare_sess_"))
+        except OSError:
+            self._cleanup()
+            return False
         ready = self.workdir / "READY"
         log_path = self.workdir / "session.log"
-        self._logf = open(log_path, "w", encoding="utf-8", errors="replace")
+        try:
+            self._logf = open(log_path, "w", encoding="utf-8", errors="replace")
+        except OSError:
+            self._cleanup()
+            return False
         cmd = [
             matlab, "-batch",
             "dynare_session_server({},{})".format(
@@ -90,7 +114,7 @@ class DynareSession:
 
         t0 = time.time()
         while time.time() - t0 < self.startup_timeout:
-            if self.proc.poll() is not None:  # died during startup
+            if self.proc is None or self.proc.poll() is not None:
                 self._cleanup()
                 return False
             if ready.exists():
@@ -148,7 +172,7 @@ class DynareSession:
             )
         else:
             mod_path = self.workdir / f"{jid}.mod"
-            mod_path.write_text(mod_text, encoding="utf-8")
+            mr._write_source_text(mod_path, mod_text)
         out_path = self.workdir / f"{jid}.out"
         job_tmp = self.workdir / f"{jid}.job.tmp"
         job_path = self.workdir / f"{jid}.job"
@@ -158,9 +182,14 @@ class DynareSession:
         )
         job_tmp.rename(job_path)  # atomic publish so the server never reads a partial job
 
-        t0 = time.time()
-        while time.time() - t0 < timeout:
+        deadline = time.monotonic() + max(timeout, 0)
+        while time.monotonic() < deadline:
             if out_path.exists():
+                # The result may have appeared between the loop's deadline
+                # check and this filesystem observation.  Timeout remains the
+                # authoritative verdict once the deadline has elapsed.
+                if time.monotonic() >= deadline:
+                    break
                 try:
                     rec = json.loads(out_path.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError) as exc:
@@ -195,27 +224,32 @@ class DynareSession:
                 return mr._shape_from_record(rec, "")
             if not self._alive():
                 message = "MATLAB session died during the run."
+                raw_log = self._tail_log()
+                self.close()
                 return {
                     "success": False, "matlab_available": True,
                     "dynare_available": True, "status": "matlab_crash",
                     "steady_state": {},
                     "blanchard_kahn": mr._bk_unavailable("session died"),
                     "errors": [message],
-                    "raw_log": self._tail_log(),
+                    "raw_log": raw_log,
                     "message": message,
                 }
             time.sleep(0.03)
 
         # Hang: kill + restart so the next job gets a clean session.
+        raw_log = self._tail_log()
         self.close()
-        self.start()
+        restarted = self.start()
+        restart_note = "session restarted" if restarted else "session restart failed"
+        message = f"Model run timed out after {timeout}s ({restart_note})."
         return {
             "success": False, "matlab_available": True, "dynare_available": True,
             "status": "timeout", "steady_state": {},
             "blanchard_kahn": mr._bk_unavailable(f"timed out after {timeout}s"),
-            "errors": [f"Model run timed out after {timeout}s (session restarted)."],
-            "raw_log": "",
-            "message": f"Model run timed out after {timeout}s (session restarted).",
+            "errors": [message],
+            "raw_log": raw_log,
+            "message": message,
         }
 
     # -- teardown -----------------------------------------------------------
@@ -224,6 +258,11 @@ class DynareSession:
         workdir = self.workdir
         if workdir is None:
             return ""
+        if self._logf is not None:
+            try:
+                self._logf.flush()
+            except OSError:
+                pass
         try:
             return (workdir / "session.log").read_text(
                 encoding="utf-8", errors="replace")[-2000:]
@@ -248,6 +287,7 @@ class DynareSession:
         self._cleanup()
 
     def _cleanup(self):
+        self.proc = None
         if self._logf is not None:
             try:
                 self._logf.close()

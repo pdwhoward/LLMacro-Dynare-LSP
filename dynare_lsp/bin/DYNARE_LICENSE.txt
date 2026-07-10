@@ -1,0 +1,995 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Dynare
+Upstream-Contact: Dynare Team, whose members in 2026 are:
+                  - Stéphane Adjemian <stephane.adjemian@univ-lemans.fr>
+                  - Michel Juillard <michel.juillard@mjui.fr>
+                  - Frédéric Karamé <frederic.karame@univ-lemans.fr>
+                  - Willi Mutschler <willi@mutschler.eu>
+                  - Johannes Pfeifer <jpfeifer@gmx.de>
+                  - Marco Ratto <marco.ratto@ec.europa.eu>
+                  - Normann Rion <normann@dynare.org>
+                  - Sébastien Villemot <sebastien@dynare.org>
+                  Former Dynare Team members include:
+                  - Houtan Bastani
+                  - Abdeljabar Benzougar
+                  - Alejandro Buesa
+                  - Fabrice Collard
+                  - Assia Ezzeroug
+                  - Dóra Kocsis
+                  - Stéphane Lhuissier
+                  - Junior Maih
+                  - Ferhat Mihoubi
+                  - George Perendia
+Source: https://www.dynare.org
+
+Files: *
+Copyright: 1996-2026 Dynare Team
+License: GPL-3+
+
+Files: matlab/+occbin/IVF_core.m
+       matlab/+occbin/match_function.m
+Copyright: none
+License: public-domain-inversion-filter
+ Original authors: Pablo Cuba-Borda, Luca Guerrieri, Matteo Iacoviello, and Molin Zhong
+ Original file downloaded from:
+ http://www.lguerrieri.com/jae-replication.zip
+ Adapted for Dynare by Dynare Team.
+ .
+ This code is in the public domain and may be used freely.
+ However the authors would appreciate acknowledgement of the source by
+ citation of any of the following papers:
+ .
+ Pablo Cuba-Borda, Luca Guerrieri, Matteo Iacoviello, and Molin Zhong (2019): "Likelihood evaluation of models
+ with occasionally binding constraints", Journal of Applied Econometrics, 34(7), 1073-1085
+
+Files: matlab/+occbin/make_chart.m
+       matlab/+occbin/map_regime.m
+       matlab/+occbin/mkdata.m
+       matlab/+occbin/mkdatap_anticipated_2constraints_dyn.m
+       matlab/+occbin/mkdatap_anticipated_dyn.m
+       matlab/+occbin/solve_one_constraint.m
+       matlab/+occbin/solve_two_constraints.m
+Copyright: none
+License: public-domain-occbin
+ Original authors: Luca Guerrieri and Matteo Iacoviello
+ Original file downloaded from:
+ https://www.matteoiacoviello.com/research_files/occbin_20140630.zip
+ Adapted for Dynare by Dynare Team.
+ .
+ This code is in the public domain and may be used freely.
+ However the authors would appreciate acknowledgement of the source by
+ citation of any of the following papers:
+ .
+ Luca Guerrieri and Matteo Iacoviello (2015): "OccBin: A toolkit for solving
+ dynamic models with occasionally binding constraints easily"
+ Journal of Monetary Economics 70, 22-38
+
+Files: matlab/AIM/*
+Copyright: none
+License: public-domain-aim
+ This code is in the public domain and may be used freely.
+ However the authors would appreciate acknowledgement of the source by
+ citation of any of the following papers:
+ .
+ Anderson, G. and Moore, G.
+ "A Linear Algebraic Procedure for Solving Linear Perfect Foresight
+ Models."
+ Economics Letters, 17, 1985.
+ .
+ Anderson, G.
+ "Solving Linear Rational Expectations Models: A Horse Race"
+ Computational Economics, 2008, vol. 31, issue 2, pages 95-113
+ .
+ Anderson, G.
+ "A Reliable and Computationally Efficient Algorithm for Imposing the
+ Saddle Point Property in Dynamic Models"
+ Journal of Economic Dynamics and Control, 2010, vol. 34, issue 3,
+ pages 472-489
+
+Files: matlab/optimization/bfgsi1.m matlab/optimization/csolve.m matlab/optimization/csminit1.m matlab/optimization/numgrad2.m
+ matlab/optimization/numgrad3.m matlab/optimization/numgrad3_.m matlab/optimization/numgrad5.m
+ matlab/optimization/numgrad5_.m matlab/optimization/csminwel1.m matlab/+bvar/density.m
+ matlab/+bvar/toolbox.m matlab/partial_information/PI_gensys.m matlab/partial_information/PI_qzswitch.m
+ matlab/partial_information/PI_qzdiv.m
+Copyright: 1993-2009 Christopher Sims
+           2006-2025 Dynare Team
+License: GPL-3+
+
+Files: matlab/optimization/cmaes.m
+Copyright: 2001-2012 Nikolaus Hansen
+           2012-2023 Dynare Team
+License: GPL-3+
+
+Files: matlab/optimization/solvopt.m
+Copyright: 1997-2008 Alexei Kuntsevich and Franz Kappel
+           2008-2015 Giovanni Lombardo
+           2015-2017 Dynare Team
+License: GPL-3+
+
+Files: matlab/optimization/simulated_annealing.m
+Copyright: 1995 E.G.Tsionas
+           1995-2002 Thomas Werner
+           2002-2015 Giovanni Lombardo
+           2015-2017 Dynare Team
+License: GPL-3+
+
+Files: matlab/estimation/chol_SE.m
+Copyright: 2015 Johannes Pfeifer
+           2015-2023 Dynare Team
+License: GPL-3+
+
+Files: matlab/estimation/endogenous_prior.m
+Copyright: 2011 Lawrence J. Christiano, Mathias Trabandt and Karl Walentin
+           2013-2023 Dynare Team
+License: GPL-3+
+
+Files: matlab/estimation/smc/logsumexp.m
+Copyright: 2020 Nicholas J. Higham
+License: BSD-2-clause
+
+Files: matlab/one_sided_hp_filter.m
+       matlab/dseries/src/utilities/missing/one_sided_hp_filter/one_sided_hp_filter.m
+Copyright: 2010-2015 Alexander Meyer-Gohde
+           2015-2025 Dynare Team
+License: GPL-3+
+
+Files: matlab/collapse_figures_in_tabgroup.m
+Copyright: 2023 Eduard Benet Cerda
+           2024 Dynare Team
+License: GPL-3+
+
+Files: matlab/convergence_diagnostics/raftery_lewis.m
+Copyright: 2016 Benjamin Born and Johannes Pfeifer
+           2016-2023 Dynare Team
+License: GPL-3+
+
+Files: matlab/+pruned_SS/commutation.m matlab/+pruned_SS/duplication.m
+Copyright: 1997 Tom Minka <minka@microsoft.com>
+           2019-2023 Dynare Team
+License: GPL-3+
+
+Files: matlab/+pruned_SS/allVL1.m
+Copyright: 2007-2010 Bruno Luong <brunoluong@yahoo.com>
+           2020-2023 Dynare Team
+License: GPL-3+
+Comment: The original author gave authorization to change
+ the license from BSD-2-clause to GPL-3+ and redistribute
+ it under GPL-3+ with Dynare.
+
+Files: matlab/+pruned_SS/uperm.m
+Copyright: 2014 Bruno Luong <brunoluong@yahoo.com>
+           2020-2023 Dynare Team
+License: GPL-3+
+Comment: The original author gave authorization to change
+ the license from BSD-2-clause to GPL-3+ and redistribute
+ it under GPL-3+ with Dynare.
+
+Files: matlab/+pruned_SS/prodmom.m matlab/+pruned_SS/bivmom.m
+Copyright: 2008-2015 Raymond Kan <kan@chass.utoronto.ca>
+           2019-2025 Dynare Team
+License: GPL-3+
+Comment: The author gave authorization to redistribute
+ these functions under GPL-3+ with Dynare and would
+ appreciate acknowledgement of the source by citation
+ of the following paper:
+ Kan, R.: "From moments of sum to moments of product."
+ Journal of Multivariate Analysis, 2008, vol. 99, issue 3,
+ pages 542-554.
+
+Files: matlab/+gsa/Morris_Measure_Groups.m
+       matlab/+gsa/Sampling_Function_2.m
+Copyright: 2005 European Commission
+           2012-2023 Dynare Team
+License: GPL-3+
+Comment: Written by Jessica Cariboni and Francesca Campolongo
+ Joint Research Centre, The European Commission,
+
+Files: matlab/+gsa/cumplot.m
+       matlab/+gsa/monte_carlo_filtering.m
+       matlab/+gsa/skewness.m
+       matlab/+gsa/log_transform.m
+       matlab/+gsa/map_calibration.m
+       matlab/+gsa/map_identification.m
+       matlab/+gsa/monte_carlo_filtering_analysis.m
+       matlab/+gsa/boxplot.m
+       matlab/+gsa/prior_draw.m
+       matlab/+gsa/reduced_form_mapping.m
+       matlab/+gsa/reduced_form_screening.m
+       matlab/+gsa/scatter_mcf.m
+       matlab/+gsa/smirnov_test.m
+       matlab/+gsa/stability_mapping.m
+       matlab/+gsa/stability_mapping_univariate.m
+       matlab/+gsa/stability_mapping_bivariate.m
+       matlab/+gsa/standardize_columns.m
+       matlab/+gsa/tcrit.m
+       matlab/+gsa/teff.m
+Copyright: 2011-2018 European Commission
+           2011-2025 Dynare Team
+License: GPL-3+
+
+Files: matlab/optimization/simpsa.m matlab/optimization/simpsaget.m matlab/optimization/simpsaset.m
+Copyright: 2005 Henning Schmidt, FCC, henning@fcc.chalmers.se
+           2006 Brecht Donckels, BIOMATH, brecht.donckels@ugent.be
+           2013-2022 Dynare Team
+License: GPL-3+
+
+Files: matlab/missing/stats/normpdf.m matlab/missing/stats/gamcdf.m
+ matlab/missing/stats/chi2inv.m
+ matlab/missing/stats/common_size.m
+ matlab/missing/stats/gampdf.m
+ matlab/missing/stats/stdnormal_inv.m matlab/missing/stats/betacdf.m
+ matlab/missing/stats/betapdf.m matlab/missing/stats/normcdf.m
+ matlab/missing/stats/stdnormal_cdf.m matlab/missing/stats/norminv.m
+ matlab/missing/stats/stdnormal_pdf.m
+Copyright: 1995-2007 Kurt Hornik
+           2008-2025 Dynare Team
+License: GPL-3+
+
+Files: matlab/missing/stats/gaminv.m matlab/missing/stats/betainv.m
+Copyright: 2012 Rik Wehbring
+           1995-2016 Kurt Hornik
+           2022-2024 Andreas Bertsatos, abertsatos@biol.uoa.gr
+           2008-2026 Dynare Team
+License: GPL-3+
+
+Files: matlab/missing/stats/quantile.m
+Copyright: 2014-2016 Christopher Hummersone
+           2016-2025 Dynare Team
+License: GPL-3+
+
+Files: matlab/missing/stats/corr.m
+Copyright: 1993-1996 Kurt Hornik
+           1996-2015 John W. Eaton
+           2013-2015 Julien Bect
+           2016-2023 Dynare Team
+License: GPL-3+
+
+Files: matlab/missing/stats/mvncdf.m
+       matlab/missing/stats_matlab/tvncdf.m
+Copyright: 2008 Arno Onken <asnelt@asnelt.org>
+           2022-2023 Andreas Bertsatos <abertsatos@biol.uoa.gr>
+           2025 Dynare Team
+License: GPL-3+
+Comment: Code adapted from the GNU Octave statistics package (version 1.7.7):
+ https://github.com/gnu-octave/statistics
+
+Files: matlab/missing/stats_matlab/mvtcdfqmc.m
+Copyright: 2022 Andreas Bertsatos <abertsatos@biol.uoa.gr>
+           2025 Dynare Team
+License: GPL-3+
+Comment: Code adapted from the GNU Octave statistics package (version 1.7.7):
+ https://github.com/gnu-octave/statistics
+
+Files: matlab/missing/stats_matlab/bvncdf.m
+Copyright: 2022-2023 Andreas Bertsatos <abertsatos@biol.uoa.gr>
+           2025 Dynare Team
+License: GPL-3+
+Comment: Code adapted from the GNU Octave statistics package (version 1.7.7):
+ https://github.com/gnu-octave/statistics
+
+Files: matlab/missing/stats/skewness.m
+       matlab/missing/stats/kurtosis.m
+Copyright: 1996-2025 The Octave Project Developers
+           2025 Dynare Team
+License: GPL-3+
+Comment: Algorithm adapted from GNU Octave (version 9.x):
+ https://github.com/gnu-octave/octave
+
+Files: matlab/lmmcp/catstruct.m
+Copyright: 2005 Jos van der Geest <jos@jasen.nl>
+           2013 Christophe Gouel
+           2016-2021 Dynare Team
+License: BSD-2-clause
+
+Files: matlab/lmmcp/lmmcp.m
+Copyright: 2005 Christian Kanzow and Stefania Petra
+           2013 Christophe Gouel
+           2014-2017 Dynare Team
+License: permissive-lmmcp
+ Unlimited permission is granted to everyone to use, copy, modify or
+ distribute this software.
+
+Files: matlab/utilities/graphics/distinguishable_colors.m
+Copyright: 2010-2011 Timothy E. Holy
+           2017-2025 Dynare Team
+License: BSD-2-clause
+
+Files: matlab/utilities/graphics/colorspace.m
+Copyright: 2005-2010 Pascal Getreuer
+           2017-2023 Dynare Team
+License: BSD-2-clause
+
+Files: examples/estimation/schorfheide_2000_data.m tests/estimation/pct/fs2000_data.m
+Copyright: 2000-2022 Frank Schorfheide
+           2023-2025 Dynare Team
+License: CC-BY-SA-4.0
+
+Files: tests/estimation/pct/SW_2007_fmincon_parallel.mod
+Copyright: 2007-2013 Frank Smets and Raf Wouters
+           2013-2024 Johannes Pfeifer
+           2025 Dynare Team
+License: GPL-3+
+
+Files: tests/occbin/ppf/swpkfppf.mod
+Copyright: 2007-2013 Frank Smets and Raf Wouters
+           2013-2025 Johannes Pfeifer
+           2026 Dynare Team
+License: GPL-3+
+
+Files: matlab/distributions/closed_skew_normal/csn_mean.m
+       matlab/distributions/closed_skew_normal/csn_variance.m
+       matlab/distributions/gaussian/gaussian_cdf_derivative.m
+Copyright: 2022-2023 Gaygysyz Guljanov
+           2025-2026 Dynare Team
+License: GPL-3+
+
+Files: matlab/distributions/closed_skew_normal/csn_prune_distribution.m
+       matlab/distributions/closed_skew_normal/csn_quantile.m
+Copyright: 2022-2023 Gaygysyz Guljanov, Willi Mutschler
+           2025-2026 Dynare Team
+License: GPL-3+
+
+Files: matlab/distributions/closed_skew_normal/csn_singular_to_csn_proper.m
+       matlab/distributions/closed_skew_normal/csn_statespace_linear_transform.m
+Copyright: 2023 Gaygysyz Guljanov
+           2025 Dynare Team
+License: GPL-3+
+
+Files: matlab/distributions/closed_skew_normal/rand_multivariate_csn.m
+Copyright: 2015 Dmitry Pavlyuk, Eugene Girtcius (rcsn.R function in the "csn" R package)
+           2022-2023 Gaygysyz Guljanov
+           2025 Dynare Team
+License: GPL-3+
+
+Files: matlab/distributions/gaussian/gaussian_log_mvncdf_mendell_elston.m
+Copyright: 2015 Dietmar Bauer (original implementation)
+           2022-2023 Gaygysyz Guljanov
+           2025 Dynare Team
+License: GPL-3+
+
+Files: matlab/kalman/likelihood/kalman_filter_pruned_skewed.m
+       matlab/kalman/kalman_smoother_pruned_skewed.m
+Copyright: 2024-2025 Gaygysyz Guljanov, Willi Mutschler, Mark Trede
+           2025 Dynare Team
+License: GPL-3+
+
+Files: doc/*.rst doc/*.tex doc/*.svg doc/*.pdf doc/*.bib
+Copyright: 1996-2025 Dynare Team
+License: GFDL-NIV-1.3+
+
+Files: doc/dr.tex
+Copyright: 2007-2011 Sébastien Villemot
+License: GFDL-NIV-1.3+
+
+Files: doc/bvar-a-la-sims.tex
+Copyright: 2007-2017 Sébastien Villemot
+           2016-2017 Johannes Pfeifer
+License: GFDL-NIV-1.3+
+
+Files: doc/manual/source/conf.py
+Copyright: 2018-2026 Dynare Team
+           2006-2021 Andrey Golovizin
+License: GPL-3+ and MIT
+
+Files: doc/sylvester.tex doc/tl.tex
+Copyright: 2004-2011 Ondra Kamenik
+License: GPL-3+
+
+Files: scripts/dynare.el
+Copyright: 2010 Yannick Kalantzis
+           2019-2025 Dynare Team
+License: GPL-3+
+
+Files: mex/sources/gensylv/gensylv.cc
+       mex/sources/libkorder/kord/* mex/sources/libkorder/sylv/*
+       mex/sources/libkorder/tl/* mex/sources/libkorder/utils/*
+       mex/sources/k_order_welfare/approximation_welfare.cc
+Copyright: 2004-2011 Ondra Kamenik
+           2019-2026 Dynare Team
+License: GPL-3+
+
+Files: mex/sources/sobol/sobol.f08
+Copyright: 2004-2009 John Burkardt
+           2023-2026 Dynare Team
+License: LGPL-3+
+
+Files: preprocessor/doc/macroprocessor/*
+Copyright: 2008-2024 Dynare Team
+License: CC-BY-SA-4.0
+
+Files: preprocessor/doc/preprocessor/*
+Copyright: 2007-2023 Dynare Team
+License: CC-BY-SA-4.0
+
+Files: contrib/ms-sbvar/utilities_dw/*
+Copyright: 1996-2011 Daniel Waggoner
+License: GPL-3+
+
+Files: contrib/ms-sbvar/switch_dw/*
+Copyright: 1996-2011 Daniel Waggoner and Tao Zha
+License: GPL-3+
+
+Files: contrib/ms-sbvar/switch_dw/state_space/sbvar/dw_csminwel.c
+       contrib/ms-sbvar/switch_dw/state_space/sbvar/dw_csminwel.h
+Copyright: 1996 Christopher Sims
+           2003 Karibzhanov, Waggoner and Zha
+License: GPL-3+
+
+Files: contrib/ms-sbvar/TZcode/*
+Copyright: 1996-2012 Tao Zha
+License: GPL-3+
+
+Files: contrib/ms-sbvar/TZcode/MatlabFiles/szbvar.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/phg233.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/phg235.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/pwf234.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/pmddf235.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/pmddf234.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/pmddf236.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/csminwel.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/phg234.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/pwf235.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/mnpdf.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/szasbvar.m
+Copyright: 1997-2012 Christopher A. Sims and Tao Zha
+License: GPL-3+
+
+Files: contrib/ms-sbvar/TZcode/MatlabFiles/pmddf233.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/csminit.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/gensysoldversion.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/gensys_z2new.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/gensysct.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/csminitworksuntiil0205.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/gensys_z2.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/qzdiv.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/pwf233.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/gensys.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/bfgsi.m
+Copyright: 1996-2012 Christopher A. Sims
+License: GPL-3+
+
+Files: contrib/ms-sbvar/TZcode/MatlabFiles/srestrictrwzalg.m
+Copyright: 1997-2012 Juan Rubio-Ramirez, Daniel Waggoner and Tao Zha
+License: GPL-3+
+
+Files: contrib/ms-sbvar/TZcode/MatlabFiles/clmonq.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/clgls.m
+Copyright: 1997-2012 Eric Leeper and Tao Zha
+License: GPL-3+
+
+Files: contrib/ms-sbvar/TZcode/MatlabFiles/a0lhfun.m
+Copyright: 1997-2012 Eric Leeper
+License: GPL-3+
+
+Files: contrib/ms-sbvar/TZcode/MatlabFiles/suptitle.m
+Copyright: 1997-2012 Drea Thomas
+License: GPL-3+
+
+Files: contrib/ms-sbvar/TZcode/MatlabFiles/fn_gibbsrvar.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/gibbsvar.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/simtanzphi.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/fn_gibbsglb.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/fn_gibbsrvar_setup.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/gibbsglb.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/fn_gibbsrvaroldworks.m
+Copyright: 1997-2012 Daniel Waggoner and Tao Zha
+License: GPL-3+
+
+Files: contrib/ms-sbvar/TZcode/MatlabFiles/xydata.m
+Copyright: 1997-2012 Lutz Kilian and Tao Zha
+License: GPL-3+
+
+Files: contrib/ms-sbvar/TZcode/MatlabFiles/qplot2.m
+ contrib/ms-sbvar/TZcode/MatlabFiles/ellipse.m
+Copyright: 1997-2012 Clark A. Burdick
+License: GPL-3+
+
+Files: matlab/+wait_bar/multi.m
+Copyright: 2007-2025 The MathWorks, Inc.
+License: BSD-2-clause
+
+License: BSD-2-clause
+ Redistribution and use in source and binary forms, with or without
+ modification, are permitted provided that the following conditions are
+ met:
+ .
+     * Redistributions of source code must retain the above copyright
+       notice, this list of conditions and the following disclaimer.
+     * Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in
+       the documentation and/or other materials provided with the distribution
+ .
+ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
+ LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ POSSIBILITY OF SUCH DAMAGE.
+
+License: GFDL-NIV-1.3+
+ Permission is granted to copy, distribute and/or modify this document
+ under the terms of the GNU Free Documentation License, Version 1.3 or
+ any later version published by the Free Software Foundation; with no
+ Invariant Sections, no Front-Cover Texts, and no Back-Cover Texts.
+ .
+ A copy of the license can be found at <https://www.gnu.org/licenses/fdl.txt>
+
+License: GPL-3+
+ Dynare is free software: you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+ .
+ Dynare is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+ .
+ You should have received a copy of the GNU General Public License
+ along with Dynare.  If not, see <https://www.gnu.org/licenses/>.
+
+License: LGPL-3+
+ This program is free software: you can redistribute it and/or modify
+ it under the terms of the GNU Lesser General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+ .
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU Lesser General Public License for more details.
+ .
+ You should have received a copy of the GNU Lesser General Public License
+ along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+License: CC-BY-SA-4.0
+ Attribution-ShareAlike 4.0 International
+ .
+ =======================================================================
+ .
+ Creative Commons Corporation ("Creative Commons") is not a law firm and
+ does not provide legal services or legal advice. Distribution of
+ Creative Commons public licenses does not create a lawyer-client or
+ other relationship. Creative Commons makes its licenses and related
+ information available on an "as-is" basis. Creative Commons gives no
+ warranties regarding its licenses, any material licensed under their
+ terms and conditions, or any related information. Creative Commons
+ disclaims all liability for damages resulting from their use to the
+ fullest extent possible.
+ .
+ Using Creative Commons Public Licenses
+ .
+ Creative Commons public licenses provide a standard set of terms and
+ conditions that creators and other rights holders may use to share
+ original works of authorship and other material subject to copyright
+ and certain other rights specified in the public license below. The
+ following considerations are for informational purposes only, are not
+ exhaustive, and do not form part of our licenses.
+ .
+      Considerations for licensors: Our public licenses are
+      intended for use by those authorized to give the public
+      permission to use material in ways otherwise restricted by
+      copyright and certain other rights. Our licenses are
+      irrevocable. Licensors should read and understand the terms
+      and conditions of the license they choose before applying it.
+      Licensors should also secure all rights necessary before
+      applying our licenses so that the public can reuse the
+      material as expected. Licensors should clearly mark any
+      material not subject to the license. This includes other CC-
+      licensed material, or material used under an exception or
+      limitation to copyright. More considerations for licensors:
+      wiki.creativecommons.org/Considerations_for_licensors
+ .
+      Considerations for the public: By using one of our public
+      licenses, a licensor grants the public permission to use the
+      licensed material under specified terms and conditions. If
+      the licensor's permission is not necessary for any reason--for
+      example, because of any applicable exception or limitation to
+      copyright--then that use is not regulated by the license. Our
+      licenses grant only permissions under copyright and certain
+      other rights that a licensor has authority to grant. Use of
+      the licensed material may still be restricted for other
+      reasons, including because others have copyright or other
+      rights in the material. A licensor may make special requests,
+      such as asking that all changes be marked or described.
+      Although not required by our licenses, you are encouraged to
+      respect those requests where reasonable. More_considerations
+      for the public:
+      wiki.creativecommons.org/Considerations_for_licensees
+ .
+ =======================================================================
+ .
+ Creative Commons Attribution-ShareAlike 4.0 International Public
+ License
+ .
+ By exercising the Licensed Rights (defined below), You accept and agree
+ to be bound by the terms and conditions of this Creative Commons
+ Attribution-ShareAlike 4.0 International Public License ("Public
+ License"). To the extent this Public License may be interpreted as a
+ contract, You are granted the Licensed Rights in consideration of Your
+ acceptance of these terms and conditions, and the Licensor grants You
+ such rights in consideration of benefits the Licensor receives from
+ making the Licensed Material available under these terms and
+ conditions.
+ .
+ .
+ Section 1 -- Definitions.
+ .
+   a. Adapted Material means material subject to Copyright and Similar
+      Rights that is derived from or based upon the Licensed Material
+      and in which the Licensed Material is translated, altered,
+      arranged, transformed, or otherwise modified in a manner requiring
+      permission under the Copyright and Similar Rights held by the
+      Licensor. For purposes of this Public License, where the Licensed
+      Material is a musical work, performance, or sound recording,
+      Adapted Material is always produced where the Licensed Material is
+      synched in timed relation with a moving image.
+ .
+   b. Adapter's License means the license You apply to Your Copyright
+      and Similar Rights in Your contributions to Adapted Material in
+      accordance with the terms and conditions of this Public License.
+ .
+   c. BY-SA Compatible License means a license listed at
+      creativecommons.org/compatiblelicenses, approved by Creative
+      Commons as essentially the equivalent of this Public License.
+ .
+   d. Copyright and Similar Rights means copyright and/or similar rights
+      closely related to copyright including, without limitation,
+      performance, broadcast, sound recording, and Sui Generis Database
+      Rights, without regard to how the rights are labeled or
+      categorized. For purposes of this Public License, the rights
+      specified in Section 2(b)(1)-(2) are not Copyright and Similar
+      Rights.
+ .
+   e. Effective Technological Measures means those measures that, in the
+      absence of proper authority, may not be circumvented under laws
+      fulfilling obligations under Article 11 of the WIPO Copyright
+      Treaty adopted on December 20, 1996, and/or similar international
+      agreements.
+ .
+   f. Exceptions and Limitations means fair use, fair dealing, and/or
+      any other exception or limitation to Copyright and Similar Rights
+      that applies to Your use of the Licensed Material.
+ .
+   g. License Elements means the license attributes listed in the name
+      of a Creative Commons Public License. The License Elements of this
+      Public License are Attribution and ShareAlike.
+ .
+   h. Licensed Material means the artistic or literary work, database,
+      or other material to which the Licensor applied this Public
+      License.
+ .
+   i. Licensed Rights means the rights granted to You subject to the
+      terms and conditions of this Public License, which are limited to
+      all Copyright and Similar Rights that apply to Your use of the
+      Licensed Material and that the Licensor has authority to license.
+ .
+   j. Licensor means the individual(s) or entity(ies) granting rights
+      under this Public License.
+ .
+   k. Share means to provide material to the public by any means or
+      process that requires permission under the Licensed Rights, such
+      as reproduction, public display, public performance, distribution,
+      dissemination, communication, or importation, and to make material
+      available to the public including in ways that members of the
+      public may access the material from a place and at a time
+      individually chosen by them.
+ .
+   l. Sui Generis Database Rights means rights other than copyright
+      resulting from Directive 96/9/EC of the European Parliament and of
+      the Council of 11 March 1996 on the legal protection of databases,
+      as amended and/or succeeded, as well as other essentially
+      equivalent rights anywhere in the world.
+ .
+   m. You means the individual or entity exercising the Licensed Rights
+      under this Public License. Your has a corresponding meaning.
+ .
+ .
+ Section 2 -- Scope.
+ .
+   a. License grant.
+ .
+        1. Subject to the terms and conditions of this Public License,
+           the Licensor hereby grants You a worldwide, royalty-free,
+           non-sublicensable, non-exclusive, irrevocable license to
+           exercise the Licensed Rights in the Licensed Material to:
+ .
+             a. reproduce and Share the Licensed Material, in whole or
+                in part; and
+ .
+             b. produce, reproduce, and Share Adapted Material.
+ .
+        2. Exceptions and Limitations. For the avoidance of doubt, where
+           Exceptions and Limitations apply to Your use, this Public
+           License does not apply, and You do not need to comply with
+           its terms and conditions.
+ .
+        3. Term. The term of this Public License is specified in Section
+           6(a).
+ .
+        4. Media and formats; technical modifications allowed. The
+           Licensor authorizes You to exercise the Licensed Rights in
+           all media and formats whether now known or hereafter created,
+           and to make technical modifications necessary to do so. The
+           Licensor waives and/or agrees not to assert any right or
+           authority to forbid You from making technical modifications
+           necessary to exercise the Licensed Rights, including
+           technical modifications necessary to circumvent Effective
+           Technological Measures. For purposes of this Public License,
+           simply making modifications authorized by this Section 2(a)
+           (4) never produces Adapted Material.
+ .
+        5. Downstream recipients.
+ .
+             a. Offer from the Licensor -- Licensed Material. Every
+                recipient of the Licensed Material automatically
+                receives an offer from the Licensor to exercise the
+                Licensed Rights under the terms and conditions of this
+                Public License.
+ .
+             b. Additional offer from the Licensor -- Adapted Material.
+                Every recipient of Adapted Material from You
+                automatically receives an offer from the Licensor to
+                exercise the Licensed Rights in the Adapted Material
+                under the conditions of the Adapter's License You apply.
+ .
+             c. No downstream restrictions. You may not offer or impose
+                any additional or different terms or conditions on, or
+                apply any Effective Technological Measures to, the
+                Licensed Material if doing so restricts exercise of the
+                Licensed Rights by any recipient of the Licensed
+                Material.
+ .
+        6. No endorsement. Nothing in this Public License constitutes or
+           may be construed as permission to assert or imply that You
+           are, or that Your use of the Licensed Material is, connected
+           with, or sponsored, endorsed, or granted official status by,
+           the Licensor or others designated to receive attribution as
+           provided in Section 3(a)(1)(A)(i).
+ .
+   b. Other rights.
+ .
+        1. Moral rights, such as the right of integrity, are not
+           licensed under this Public License, nor are publicity,
+           privacy, and/or other similar personality rights; however, to
+           the extent possible, the Licensor waives and/or agrees not to
+           assert any such rights held by the Licensor to the limited
+           extent necessary to allow You to exercise the Licensed
+           Rights, but not otherwise.
+ .
+        2. Patent and trademark rights are not licensed under this
+           Public License.
+ .
+        3. To the extent possible, the Licensor waives any right to
+           collect royalties from You for the exercise of the Licensed
+           Rights, whether directly or through a collecting society
+           under any voluntary or waivable statutory or compulsory
+           licensing scheme. In all other cases the Licensor expressly
+           reserves any right to collect such royalties.
+ .
+ .
+ Section 3 -- License Conditions.
+ .
+ Your exercise of the Licensed Rights is expressly made subject to the
+ following conditions.
+ .
+   a. Attribution.
+ .
+        1. If You Share the Licensed Material (including in modified
+           form), You must:
+ .
+             a. retain the following if it is supplied by the Licensor
+                with the Licensed Material:
+ .
+                  i. identification of the creator(s) of the Licensed
+                     Material and any others designated to receive
+                     attribution, in any reasonable manner requested by
+                     the Licensor (including by pseudonym if
+                     designated);
+ .
+                 ii. a copyright notice;
+ .
+                iii. a notice that refers to this Public License;
+ .
+                 iv. a notice that refers to the disclaimer of
+                     warranties;
+ .
+                  v. a URI or hyperlink to the Licensed Material to the
+                     extent reasonably practicable;
+ .
+             b. indicate if You modified the Licensed Material and
+                retain an indication of any previous modifications; and
+ .
+             c. indicate the Licensed Material is licensed under this
+                Public License, and include the text of, or the URI or
+                hyperlink to, this Public License.
+ .
+        2. You may satisfy the conditions in Section 3(a)(1) in any
+           reasonable manner based on the medium, means, and context in
+           which You Share the Licensed Material. For example, it may be
+           reasonable to satisfy the conditions by providing a URI or
+           hyperlink to a resource that includes the required
+           information.
+ .
+        3. If requested by the Licensor, You must remove any of the
+           information required by Section 3(a)(1)(A) to the extent
+           reasonably practicable.
+ .
+   b. ShareAlike.
+ .
+      In addition to the conditions in Section 3(a), if You Share
+      Adapted Material You produce, the following conditions also apply.
+ .
+        1. The Adapter's License You apply must be a Creative Commons
+           license with the same License Elements, this version or
+           later, or a BY-SA Compatible License.
+ .
+        2. You must include the text of, or the URI or hyperlink to, the
+           Adapter's License You apply. You may satisfy this condition
+           in any reasonable manner based on the medium, means, and
+           context in which You Share Adapted Material.
+ .
+        3. You may not offer or impose any additional or different terms
+           or conditions on, or apply any Effective Technological
+           Measures to, Adapted Material that restrict exercise of the
+           rights granted under the Adapter's License You apply.
+ .
+ .
+ Section 4 -- Sui Generis Database Rights.
+ .
+ Where the Licensed Rights include Sui Generis Database Rights that
+ apply to Your use of the Licensed Material:
+ .
+   a. for the avoidance of doubt, Section 2(a)(1) grants You the right
+      to extract, reuse, reproduce, and Share all or a substantial
+      portion of the contents of the database;
+ .
+   b. if You include all or a substantial portion of the database
+      contents in a database in which You have Sui Generis Database
+      Rights, then the database in which You have Sui Generis Database
+      Rights (but not its individual contents) is Adapted Material,
+ .
+      including for purposes of Section 3(b); and
+   c. You must comply with the conditions in Section 3(a) if You Share
+      all or a substantial portion of the contents of the database.
+ .
+ For the avoidance of doubt, this Section 4 supplements and does not
+ replace Your obligations under this Public License where the Licensed
+ Rights include other Copyright and Similar Rights.
+ .
+ .
+ Section 5 -- Disclaimer of Warranties and Limitation of Liability.
+ .
+   a. UNLESS OTHERWISE SEPARATELY UNDERTAKEN BY THE LICENSOR, TO THE
+      EXTENT POSSIBLE, THE LICENSOR OFFERS THE LICENSED MATERIAL AS-IS
+      AND AS-AVAILABLE, AND MAKES NO REPRESENTATIONS OR WARRANTIES OF
+      ANY KIND CONCERNING THE LICENSED MATERIAL, WHETHER EXPRESS,
+      IMPLIED, STATUTORY, OR OTHER. THIS INCLUDES, WITHOUT LIMITATION,
+      WARRANTIES OF TITLE, MERCHANTABILITY, FITNESS FOR A PARTICULAR
+      PURPOSE, NON-INFRINGEMENT, ABSENCE OF LATENT OR OTHER DEFECTS,
+      ACCURACY, OR THE PRESENCE OR ABSENCE OF ERRORS, WHETHER OR NOT
+      KNOWN OR DISCOVERABLE. WHERE DISCLAIMERS OF WARRANTIES ARE NOT
+      ALLOWED IN FULL OR IN PART, THIS DISCLAIMER MAY NOT APPLY TO YOU.
+ .
+   b. TO THE EXTENT POSSIBLE, IN NO EVENT WILL THE LICENSOR BE LIABLE
+      TO YOU ON ANY LEGAL THEORY (INCLUDING, WITHOUT LIMITATION,
+      NEGLIGENCE) OR OTHERWISE FOR ANY DIRECT, SPECIAL, INDIRECT,
+      INCIDENTAL, CONSEQUENTIAL, PUNITIVE, EXEMPLARY, OR OTHER LOSSES,
+      COSTS, EXPENSES, OR DAMAGES ARISING OUT OF THIS PUBLIC LICENSE OR
+      USE OF THE LICENSED MATERIAL, EVEN IF THE LICENSOR HAS BEEN
+      ADVISED OF THE POSSIBILITY OF SUCH LOSSES, COSTS, EXPENSES, OR
+      DAMAGES. WHERE A LIMITATION OF LIABILITY IS NOT ALLOWED IN FULL OR
+      IN PART, THIS LIMITATION MAY NOT APPLY TO YOU.
+ .
+   c. The disclaimer of warranties and limitation of liability provided
+      above shall be interpreted in a manner that, to the extent
+      possible, most closely approximates an absolute disclaimer and
+      waiver of all liability.
+ .
+ .
+ Section 6 -- Term and Termination.
+ .
+   a. This Public License applies for the term of the Copyright and
+      Similar Rights licensed here. However, if You fail to comply with
+      this Public License, then Your rights under this Public License
+      terminate automatically.
+ .
+   b. Where Your right to use the Licensed Material has terminated under
+      Section 6(a), it reinstates:
+ .
+        1. automatically as of the date the violation is cured, provided
+           it is cured within 30 days of Your discovery of the
+           violation; or
+ .
+        2. upon express reinstatement by the Licensor.
+ .
+      For the avoidance of doubt, this Section 6(b) does not affect any
+      right the Licensor may have to seek remedies for Your violations
+      of this Public License.
+ .
+   c. For the avoidance of doubt, the Licensor may also offer the
+      Licensed Material under separate terms or conditions or stop
+      distributing the Licensed Material at any time; however, doing so
+      will not terminate this Public License.
+ .
+   d. Sections 1, 5, 6, 7, and 8 survive termination of this Public
+      License.
+ .
+ .
+ Section 7 -- Other Terms and Conditions.
+ .
+   a. The Licensor shall not be bound by any additional or different
+      terms or conditions communicated by You unless expressly agreed.
+ .
+   b. Any arrangements, understandings, or agreements regarding the
+      Licensed Material not stated herein are separate from and
+      independent of the terms and conditions of this Public License.
+ .
+ .
+ Section 8 -- Interpretation.
+ .
+   a. For the avoidance of doubt, this Public License does not, and
+      shall not be interpreted to, reduce, limit, restrict, or impose
+      conditions on any use of the Licensed Material that could lawfully
+      be made without permission under this Public License.
+ .
+   b. To the extent possible, if any provision of this Public License is
+      deemed unenforceable, it shall be automatically reformed to the
+      minimum extent necessary to make it enforceable. If the provision
+      cannot be reformed, it shall be severed from this Public License
+      without affecting the enforceability of the remaining terms and
+      conditions.
+ .
+   c. No term or condition of this Public License will be waived and no
+      failure to comply consented to unless expressly agreed to by the
+      Licensor.
+ .
+   d. Nothing in this Public License constitutes or may be interpreted
+      as a limitation upon, or waiver of, any privileges and immunities
+      that apply to the Licensor or You, including from the legal
+      processes of any jurisdiction or authority.
+ .
+ .
+ =======================================================================
+ .
+ Creative Commons is not a party to its public licenses.
+ Notwithstanding, Creative Commons may elect to apply one of its public
+ licenses to material it publishes and in those instances will be
+ considered the "Licensor." Except for the limited purpose of indicating
+ that material is shared under a Creative Commons public license or as
+ otherwise permitted by the Creative Commons policies published at
+ creativecommons.org/policies, Creative Commons does not authorize the
+ use of the trademark "Creative Commons" or any other trademark or logo
+ of Creative Commons without its prior written consent including,
+ without limitation, in connection with any unauthorized modifications
+ to any of its public licenses or any other arrangements,
+ understandings, or agreements concerning use of licensed material. For
+ the avoidance of doubt, this paragraph does not form part of the public
+ licenses.
+ .
+ Creative Commons may be contacted at creativecommons.org.
+
+License: MIT
+ Permission is hereby granted, free of charge, to any person obtaining
+ a copy of this software and associated documentation files (the
+ "Software"), to deal in the Software without restriction, including
+ without limitation the rights to use, copy, modify, merge, publish,
+ distribute, sublicense, and/or sell copies of the Software, and to
+ permit persons to whom the Software is furnished to do so, subject to
+ the following conditions:
+ .
+ The above copyright notice and this permission notice shall be
+ included in all copies or substantial portions of the Software.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+ IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+ CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+ SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

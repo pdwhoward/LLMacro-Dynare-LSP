@@ -12,8 +12,10 @@ import os
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import List, Optional, Tuple
@@ -28,6 +30,9 @@ from .parser import (
     _strip_non_macro_comments,
 )
 from .diagnostics import Diagnostic, Severity
+
+
+_ORIGINAL_SUBPROCESS_RUN = subprocess.run
 
 
 @dataclass
@@ -209,11 +214,11 @@ _INCLUDE_DIRECTIVE_RE = re.compile(
 )
 
 
-_MACRO_DEFINE_LINE_RE = re.compile(
-    r"^[ \t]*@#\s*define\b.*$",
+_MACRO_DIRECTIVE_LINE_RE = re.compile(
+    r"^[ \t]*@#.*$",
     re.IGNORECASE | re.MULTILINE,
 )
-_DOUBLE_QUOTED_RE = re.compile(r'"([^"\n]*)"')
+_MACRO_QUOTED_LITERAL_RE = re.compile(r"(?P<quote>[\"'])(?P<value>[^\"'\n]*)(?P=quote)")
 
 
 def rewrite_supplied_absolute_includes(
@@ -227,11 +232,11 @@ def rewrite_supplied_absolute_includes(
     materializes the supplied content elsewhere, but an absolute include
     directive would still make the preprocessor read the real disk file —
     so any absolute include whose normalized target has a mirror copy is
-    rewritten to that copy's path.  ``@#include`` also accepts string
-    EXPRESSIONS built from ``@#define``d paths (``@#include F`` or
-    ``@#include P + "/x.mod"``), so absolute path literals inside
-    ``@#define`` values are remapped too — both exact supplied-file paths
-    and the supplied files' parent directories.
+    rewritten to that copy's path. ``@#include`` and ``@#includepath`` also
+    accept paths held in macro variables, so matching path literals on all
+    macro-directive lines are remapped together. Rewriting comparisons along
+    with definitions preserves branch semantics such as
+    ``@#if P == "/original/path"``.
     """
     dir_by_norm: "dict[str, str]" = {}
     for norm_key, target in target_by_norm.items():
@@ -255,30 +260,53 @@ def rewrite_supplied_absolute_includes(
             return str(mirror_dir).replace("\\", "/")
         return None
 
+    def _with_trailing_separator(raw: str, mapped: str) -> str:
+        if raw.rstrip()[-1:] in ("/", "\\") and not mapped.endswith("/"):
+            return mapped + "/"
+        return mapped
+
+    def _map_macro_literal(raw: str) -> Optional[str]:
+        mapped = _map_absolute(raw)
+        if mapped is not None:
+            return _with_trailing_separator(raw, mapped)
+
+        # @#includepath accepts a colon-delimited search list. Map each
+        # supplied directory while preserving Windows drive prefixes.
+        parts = _split_includepath_argument(raw)
+        if len(parts) < 2:
+            return None
+        rewritten_parts: List[str] = []
+        changed = False
+        for part in parts:
+            mapped_part = _map_absolute(part)
+            if mapped_part is None:
+                rewritten_parts.append(part)
+                continue
+            rewritten_parts.append(_with_trailing_separator(part, mapped_part))
+            changed = True
+        return ":".join(rewritten_parts) if changed else None
+
     def _include_repl(m: "re.Match[str]") -> str:
         mapped = _map_absolute(m.group(3))
         if mapped is None:
             return m.group(0)
         return m.group(1) + m.group(2) + mapped + m.group(4)
 
-    def _define_repl(m: "re.Match[str]") -> str:
+    def _directive_repl(m: "re.Match[str]") -> str:
         line = m.group(0)
 
         def _quoted_repl(qm: "re.Match[str]") -> str:
-            raw_value = qm.group(1)
-            mapped = _map_absolute(raw_value)
+            raw_value = qm.group("value")
+            mapped = _map_macro_literal(raw_value)
             if mapped is None:
                 return qm.group(0)
-            # ``@#define P = "C:/dir/"`` concatenated as P + "file.mod"
-            # needs the trailing separator preserved (abspath strips it).
-            if raw_value.rstrip()[-1:] in ("/", "\\") and not mapped.endswith("/"):
-                mapped += "/"
-            return f'"{mapped}"'
+            quote = qm.group("quote")
+            return f"{quote}{mapped}{quote}"
 
-        return _DOUBLE_QUOTED_RE.sub(_quoted_repl, line)
+        return _MACRO_QUOTED_LITERAL_RE.sub(_quoted_repl, line)
 
     content = _INCLUDE_DIRECTIVE_RE.sub(_include_repl, content)
-    return _MACRO_DEFINE_LINE_RE.sub(_define_repl, content)
+    return _MACRO_DIRECTIVE_LINE_RE.sub(_directive_repl, content)
 
 
 def _slash_path(path: str) -> str:
@@ -380,16 +408,24 @@ def _split_includepath_argument(argument: str) -> List[str]:
     return [part for part in parts if part]
 
 
-def _requires_source_dir_file(mod_text: str) -> bool:
-    """Whether Dynare needs the synthetic model beside source-relative includes."""
+def _active_include_paths(mod_text: str) -> List[str]:
+    """Return statically-resolved include paths from active macro branches."""
     macro_scan = _strip_non_macro_comments(mod_text)
     _defines, active_lines, _line_defines = _macro_branch_state(macro_scan)
     macro_scan = _mask_inactive_macro_lines(macro_scan, active_lines)
+    return [include.filename for include in _parse_includes(macro_scan)]
+
+
+def _requires_source_dir_file(mod_text: str) -> bool:
+    """Whether Dynare needs the synthetic model beside source-relative includes."""
     if any(
-        not _is_absolute_macro_path(include.filename)
-        for include in _parse_includes(macro_scan)
+        not _is_absolute_macro_path(include_path)
+        for include_path in _active_include_paths(mod_text)
     ):
         return True
+    macro_scan = _strip_non_macro_comments(mod_text)
+    _defines, active_lines, _line_defines = _macro_branch_state(macro_scan)
+    macro_scan = _mask_inactive_macro_lines(macro_scan, active_lines)
     for directive in _parse_macro_directives(macro_scan):
         if directive.kind != "includepath" or directive.argument is None:
             continue
@@ -397,6 +433,78 @@ def _requires_source_dir_file(mod_text: str) -> bool:
         if not parts or any(not _is_absolute_macro_path(part) for part in parts):
             return True
     return False
+
+
+def _include_search_directories(
+    mod_text: str,
+    source_dir: Optional[str],
+) -> List[str]:
+    """Collect include-file directories needed by nested relative includes.
+
+    Dynare resolves every relative ``@#include`` against the process working
+    directory and its ``-I`` search list, not against the directory of the
+    file containing that directive. Add each statically-resolvable included
+    file's parent directory so an absolute (or subdirectory-relative) include
+    can itself include a sibling file.
+    """
+    directories: List[str] = []
+    seen_directories: set[str] = set()
+    seen_files: set[str] = set()
+
+    def _add_directory(path: str) -> None:
+        absolute = os.path.abspath(path)
+        key = os.path.normcase(absolute)
+        if key not in seen_directories:
+            seen_directories.add(key)
+            directories.append(absolute)
+
+    def _walk(content: str, base_dir: Optional[str]) -> None:
+        for raw_path in _active_include_paths(content):
+            include_path = raw_path.strip()
+            if (
+                len(include_path) >= 2
+                and include_path[0] == include_path[-1]
+                and include_path[0] in {"'", '"'}
+            ):
+                include_path = include_path[1:-1].strip()
+            if not include_path or "@{" in include_path:
+                continue
+
+            if _is_absolute_macro_path(include_path):
+                # A Windows path is not traversable on POSIX (and vice versa),
+                # even though PureWindowsPath can still recognize its syntax.
+                if not os.path.isabs(include_path):
+                    continue
+                candidate = os.path.abspath(include_path)
+            elif base_dir is not None:
+                candidate = os.path.abspath(os.path.join(base_dir, include_path))
+            else:
+                continue
+
+            if not os.path.isfile(candidate):
+                continue
+            parent = os.path.dirname(candidate)
+            _add_directory(parent)
+
+            file_key = os.path.normcase(candidate)
+            if file_key in seen_files:
+                continue
+            seen_files.add(file_key)
+            try:
+                with open(
+                    candidate,
+                    "r",
+                    encoding="utf-8-sig",
+                    errors="replace",
+                    newline="",
+                ) as include_file:
+                    nested_content = include_file.read()
+            except OSError:
+                continue
+            _walk(nested_content, parent)
+
+    _walk(mod_text, source_dir)
+    return directories
 
 
 def _macro_path_is_synthetic(
@@ -668,6 +776,137 @@ def _parse_preprocessor_output(
 # ---------------------------------------------------------------------------
 
 
+def _preprocessor_runtime_diagnostic(message: str) -> Diagnostic:
+    return Diagnostic(
+        range=SourceRange(Position(0, 0), Position(0, 1)),
+        severity=Severity.WARNING,
+        message=message,
+        source="dynare-preprocessor",
+        code="P000",
+    )
+
+
+def _popen_process_group_kwargs() -> dict:
+    """Start the preprocessor in a group that can be killed on timeout."""
+    if os.name == "nt":
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        return {"creationflags": creationflags} if creationflags else {}
+    return {"start_new_session": True}
+
+
+def _terminate_process_tree(proc: "subprocess.Popen[str]") -> None:
+    """Best-effort, bounded termination of a preprocessor process tree."""
+    tree_killed = False
+    if os.name == "nt":
+        try:
+            completed = subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=2,
+            )
+            tree_killed = completed.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+            tree_killed = True
+        except OSError:
+            pass
+
+    if not tree_killed and proc.poll() is None:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=1)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _drain_process_after_timeout(proc: "subprocess.Popen[str]") -> None:
+    """Close captured pipes without letting a surviving child delay return."""
+    try:
+        proc.communicate(timeout=1)
+        return
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    for stream in (proc.stdout, proc.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+
+def _execute_preprocessor(
+    cmd: List[str],
+    *,
+    timeout: int,
+    cwd: str,
+):
+    """Run one preprocessor command with timeout-safe tree cleanup."""
+    common_kwargs = {
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "cwd": cwd,
+    }
+
+    # Existing embedders and tests replace subprocess.run to inject a runner.
+    # Keep honoring that hook while the normal path uses Popen so it can retain
+    # the process handle needed for descendant-tree cleanup.
+    if subprocess.run is not _ORIGINAL_SUBPROCESS_RUN:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            timeout=timeout,
+            **common_kwargs,
+        )
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        **common_kwargs,
+        **_popen_process_group_kwargs(),
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_process_tree(proc)
+        _drain_process_after_timeout(proc)
+        raise
+    return subprocess.CompletedProcess(
+        cmd,
+        proc.returncode if proc.returncode is not None else -1,
+        stdout,
+        stderr,
+    )
+
+
+def _remove_artifact_with_retries(path: str, attempts: int = 4) -> None:
+    """Remove a generated file or directory despite brief sharing locks."""
+    for attempt in range(attempts):
+        try:
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
+            if attempt + 1 == attempts:
+                return
+            time.sleep(0.02 * (2**attempt))
+        except OSError:
+            return
+
+
 def run_preprocessor(
     mod_text: str,
     preprocessor_path: str,
@@ -704,9 +943,10 @@ def run_preprocessor(
         use_source_dir_file = source_dir_abs is not None and _requires_source_dir_file(
             mod_text
         )
-        run_cwd = source_dir_abs if use_source_dir_file else tmp_dir
+        run_cwd = tmp_dir
         if use_source_dir_file:
             assert source_dir_abs is not None
+            run_cwd = source_dir_abs
             fd, tmp_file = tempfile.mkstemp(
                 prefix=".dynare_lsp_",
                 suffix=".mod",
@@ -719,23 +959,21 @@ def run_preprocessor(
             )
         else:
             tmp_file = os.path.join(tmp_dir, "model.mod")
-        with open(tmp_file, "w", encoding="utf-8") as f:
+        with open(tmp_file, "w", encoding="utf-8", newline="") as f:
             f.write(mod_text)
 
+        include_search_dirs = _include_search_directories(mod_text, source_dir_abs)
         cmd = [
             preprocessor_path,
             tmp_file,
             "json=check",
             "onlyjson",
             "nopreprocessoroutput",
+            *(f"-I{path}" for path in include_search_dirs),
         ]
 
-        result = subprocess.run(
+        result = _execute_preprocessor(
             cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=timeout,
             cwd=run_cwd,
         )
@@ -747,6 +985,18 @@ def run_preprocessor(
             raw_output,
             synthetic_path=tmp_file,
         )
+        if result.returncode != 0 and not diagnostics:
+            output_detail = (
+                "without producing output"
+                if not raw_output.strip()
+                else "without reporting a parseable diagnostic"
+            )
+            diagnostics.append(
+                _preprocessor_runtime_diagnostic(
+                    f"Dynare preprocessor exited with code {result.returncode} "
+                    f"{output_detail}"
+                )
+            )
 
         return PreprocessorResult(
             success=result.returncode == 0,
@@ -762,12 +1012,8 @@ def run_preprocessor(
         return PreprocessorResult(
             success=False,
             diagnostics=[
-                Diagnostic(
-                    range=SourceRange(Position(0, 0), Position(0, 1)),
-                    severity=Severity.WARNING,
-                    message=f"Dynare preprocessor timed out after {timeout}s",
-                    source="dynare-preprocessor",
-                    code="P000",
+                _preprocessor_runtime_diagnostic(
+                    f"Dynare preprocessor timed out after {timeout}s"
                 )
             ],
             raw_output="",
@@ -777,42 +1023,22 @@ def run_preprocessor(
         message = f"Could not run Dynare preprocessor '{preprocessor_path}': {e}"
         return PreprocessorResult(
             success=False,
-            diagnostics=[
-                Diagnostic(
-                    range=SourceRange(Position(0, 0), Position(0, 1)),
-                    severity=Severity.WARNING,
-                    message=message,
-                    source="dynare-preprocessor",
-                    code="P000",
-                )
-            ],
+            diagnostics=[_preprocessor_runtime_diagnostic(message)],
             raw_output=str(e),
             preprocessor_path=preprocessor_path,
         )
     finally:
         if generated_root:
-            try:
-                if os.path.isdir(generated_root):
-                    shutil.rmtree(generated_root, ignore_errors=True)
-                elif os.path.exists(generated_root):
-                    os.remove(generated_root)
-            except OSError:
-                pass
+            _remove_artifact_with_retries(generated_root)
         if (
             tmp_file
             and source_dir_abs
             and os.path.normcase(os.path.abspath(os.path.dirname(tmp_file)))
             == os.path.normcase(source_dir_abs)
         ):
-            try:
-                os.remove(tmp_file)
-            except OSError:
-                pass
+            _remove_artifact_with_retries(tmp_file)
         if tmp_dir:
-            try:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-            except Exception:
-                pass
+            _remove_artifact_with_retries(tmp_dir)
 
 
 def _diagnostic_to_struct(d: Diagnostic) -> dict:

@@ -46,6 +46,7 @@ import json
 import math
 import os
 import platform
+import re
 import signal
 import shutil
 import subprocess
@@ -85,6 +86,18 @@ _DEFAULT_MATLAB_WINDOWS = r"C:\Program Files\MATLAB\R2026a\bin\matlab.exe"
 _DEFAULT_DYNARE_WINDOWS = "C:/Program Files/dynare/7.1/matlab"
 
 _DEFAULT_TIMEOUT = 300
+
+_INCLUDE_LITERAL_RE = re.compile(
+    r"""
+    ^(?P<prefix>\ufeff?[ \t]*@\#\s*include\s+)
+    (?:
+        "(?P<double>[^"\r\n]+)"
+      | '(?P<single>[^'\r\n]+)'
+      | (?P<bare>[^\s"'][^\s\r\n]*)
+    )
+    """,
+    re.IGNORECASE | re.MULTILINE | re.VERBOSE,
+)
 
 
 def _matlab_char_literal(value: str) -> str:
@@ -471,38 +484,125 @@ def _workspace_relative_path(
     return rel
 
 
+def _path_identity(path: Path) -> str:
+    """Return a host-normalized identity for a supplied workspace path."""
+    try:
+        normalized = path.resolve(strict=False)
+    except (OSError, RuntimeError):
+        normalized = path.absolute()
+    return os.path.normcase(os.path.normpath(str(normalized)))
+
+
+def _unique_workspace_relative_paths(
+    filenames: List[str],
+    normalized: Dict[str, Path],
+    common_parent: Path,
+) -> Dict[str, Path]:
+    """Choose non-colliding staging paths while keeping the active file first."""
+    relative_paths: Dict[str, Path] = {}
+    used: set[str] = set()
+    collision_index = 0
+    for fname in filenames:
+        rel = _workspace_relative_path(fname, normalized, common_parent)
+        key = os.path.normcase(os.path.normpath(str(rel)))
+        if key in used:
+            while True:
+                candidate = (
+                    Path("__external__")
+                    / f"{collision_index:04d}"
+                    / normalized[fname].name
+                )
+                collision_index += 1
+                candidate_key = os.path.normcase(os.path.normpath(str(candidate)))
+                if candidate_key not in used:
+                    rel = candidate
+                    key = candidate_key
+                    break
+        relative_paths[fname] = rel
+        used.add(key)
+    return relative_paths
+
+
+def _redirect_absolute_includes(
+    content: str,
+    absolute_targets: Dict[str, Path],
+) -> str:
+    """Point literal absolute includes at their supplied staged copies."""
+
+    def _replace(match: re.Match[str]) -> str:
+        filename = match.group("double") or match.group("single") or match.group("bare")
+        include_path = _uri_to_path(filename)
+        if not include_path.is_absolute():
+            return match.group(0)
+        target = absolute_targets.get(_path_identity(include_path))
+        if target is None:
+            return match.group(0)
+        try:
+            replacement = target.resolve(strict=False).as_posix()
+        except (OSError, RuntimeError):
+            replacement = target.absolute().as_posix()
+        prefix = match.group("prefix")
+        if match.group("double") is not None:
+            return f'{prefix}"{replacement}"'
+        if match.group("single") is not None:
+            return f"{prefix}'{replacement}'"
+        return f'{prefix}"{replacement}"'
+
+    return _INCLUDE_LITERAL_RE.sub(_replace, content)
+
+
+def _write_source_text(path: Path, content: str) -> None:
+    """Write UTF-8 source bytes without platform newline translation."""
+    path.write_bytes(content.encode("utf-8"))
+
+
 def _materialize_workspace_files(
     work_dir: Path,
     active_file: str,
     files: Dict[str, str],
     active_content: str,
 ) -> Path:
-    workspace_files = dict(files)
-    workspace_files[active_file] = active_content
-    normalized = {
-        fname: _uri_to_path(fname)
-        for fname in workspace_files
-    }
+    # Keep the active document first so its path wins any spelling/case alias
+    # in the supplied map and so a fallback collision never relocates it.
+    workspace_files: Dict[str, str] = {active_file: active_content}
+    active_identity = _path_identity(_uri_to_path(active_file))
+    known_identities = {active_identity}
+    for fname, content in files.items():
+        identity = _path_identity(_uri_to_path(fname))
+        if identity in known_identities:
+            continue
+        workspace_files[fname] = content
+        known_identities.add(identity)
+    normalized = {fname: _uri_to_path(fname) for fname in workspace_files}
     parents = [str(path.parent) for path in normalized.values()]
     try:
         common_parent = Path(os.path.commonpath(parents))
     except ValueError:
         common_parent = normalized[active_file].parent
 
-    entry_parent = (
-        work_dir
-        / _workspace_relative_path(active_file, normalized, common_parent).parent
+    relative_paths = _unique_workspace_relative_paths(
+        list(workspace_files),
+        normalized,
+        common_parent,
     )
+    targets = {fname: work_dir / relative_paths[fname] for fname in workspace_files}
+    absolute_targets = {
+        _path_identity(path): targets[fname]
+        for fname, path in normalized.items()
+        if path.is_absolute()
+    }
+
+    entry_parent = targets[active_file].parent
     entry_parent.mkdir(parents=True, exist_ok=True)
 
     basename_counts: Dict[str, int] = {}
     materialized: List[Tuple[str, Path]] = []
     for fname, content in workspace_files.items():
-        rel = _workspace_relative_path(fname, normalized, common_parent)
-        target = work_dir / rel
+        target = targets[fname]
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
-        materialized.append((content, target))
+        staged_content = _redirect_absolute_includes(content, absolute_targets)
+        _write_source_text(target, staged_content)
+        materialized.append((staged_content, target))
         basename_counts[target.name] = basename_counts.get(target.name, 0) + 1
 
     for content, target in materialized:
@@ -511,13 +611,9 @@ def _materialize_workspace_files(
         alias = entry_parent / target.name
         if alias.exists():
             continue
-        alias.write_text(content, encoding="utf-8")
+        _write_source_text(alias, content)
 
-    return work_dir / _workspace_relative_path(
-        active_file,
-        normalized,
-        common_parent,
-    )
+    return targets[active_file]
 
 
 def run_dynare_matlab(
@@ -621,7 +717,7 @@ def run_dynare_matlab(
                 mod_text,
             )
         else:
-            work_model.write_text(mod_text, encoding="utf-8")
+            _write_source_text(work_model, mod_text)
 
         # Mirror build_cache.run_one's invocation exactly: matlab -batch with a
         # single run_dynare_model(mod, out_json, dynare_root) call, cwd set to
@@ -657,6 +753,7 @@ def run_dynare_matlab(
                         proc.wait(timeout=30)
                     except (subprocess.TimeoutExpired, OSError):
                         pass
+                    proc_rc = getattr(proc, "returncode", None)
         except OSError as exc:
             # MATLAB resolved to a path but could not be launched (e.g. an
             # explicit nonexistent binary the discovery step let through is
@@ -670,6 +767,22 @@ def run_dynare_matlab(
             raw_log = log_path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             raw_log = ""
+
+        if timed_out:
+            message = f"MATLAB run timed out after {timeout}s."
+            return {
+                "success": False,
+                "matlab_available": True,
+                "dynare_available": True,
+                "status": "timeout",
+                "exit_code": proc_rc,
+                "seconds": round(time.time() - t0, 1),
+                "steady_state": {},
+                "blanchard_kahn": _bk_unavailable(message),
+                "errors": [message],
+                "raw_log": raw_log,
+                "message": message,
+            }
 
         if out_json.exists():
             try:
@@ -691,11 +804,9 @@ def run_dynare_matlab(
             return _shape_from_record(rec, raw_log)
 
         # No result file: the runner never reached its write step.
-        status = "timeout" if timed_out else "matlab_crash"
+        status = "matlab_crash"
         message = (
-            f"MATLAB run timed out after {timeout}s."
-            if timed_out
-            else "MATLAB exited without writing a result "
+            "MATLAB exited without writing a result "
             f"(exit code {proc_rc}). See raw_log."
         )
         return {

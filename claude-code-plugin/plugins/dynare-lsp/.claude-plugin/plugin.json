@@ -1,6 +1,7 @@
 {
   "name": "dynare-lsp",
-  "version": "0.3.1",
+  "version": "0.4.0",
+  "license": "GPL-3.0-or-later",
   "description": "Dynare (.mod/.inc) language server for Claude Code (diagnostics + code intelligence).",
   "author": {
     "name": "LLMacro"

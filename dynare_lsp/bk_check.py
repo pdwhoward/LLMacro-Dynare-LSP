@@ -10,6 +10,7 @@ Requires scipy (optional dependency).
 
 from __future__ import annotations
 
+import ast
 import re
 from dataclasses import dataclass, field, replace
 from types import CodeType
@@ -671,6 +672,8 @@ def _replace_steady_state_operator_with_constants(
 
         def _const_repl(name_match: re.Match) -> str:
             name = name_match.group(1)
+            if name.lower() in _TIME_SUBSCRIPT_FUNCTION_NAMES:
+                return name_match.group(0)
             if name in endo_set:
                 return f"{_escape_reserved(name)}__ss"
             return name
@@ -688,6 +691,56 @@ def _replace_steady_state_operator_with_constants(
         out.append(f"({const_inner})")
         i = j
     return "".join(out)
+
+
+def _select_dynare_min_max_derivative_branches(expr: str, env: dict) -> str:
+    """Freeze min/max to the branch Dynare differentiates at the steady state.
+
+    Dynare selects the first argument only on a strict comparison and therefore
+    selects the second argument at a tie. Central differences across a tie would
+    instead average the two one-sided derivatives.
+    """
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError:
+        return expr
+
+    class _MinMaxTransformer(ast.NodeTransformer):
+        changed = False
+
+        def visit_Call(self, node: ast.Call) -> ast.AST:
+            updated = cast(ast.Call, self.generic_visit(node))
+            if (
+                not isinstance(updated.func, ast.Name)
+                or updated.func.id.lower() not in {"min", "max"}
+                or len(updated.args) != 2
+                or updated.keywords
+            ):
+                return updated
+
+            first, first_error = _safe_eval_expr(ast.unparse(updated.args[0]), env)
+            second, second_error = _safe_eval_expr(ast.unparse(updated.args[1]), env)
+            if (
+                first is None
+                or second is None
+                or first_error
+                or second_error
+            ):
+                return updated
+
+            if updated.func.id.lower() == "max":
+                select_first = first > second
+            else:
+                select_first = second > first
+            self.changed = True
+            selected = updated.args[0] if select_first else updated.args[1]
+            return ast.copy_location(selected, updated)
+
+    transformer = _MinMaxTransformer()
+    transformed = transformer.visit(tree)
+    if not transformer.changed:
+        return expr
+    return ast.unparse(ast.fix_missing_locations(transformed))
 
 
 # ---------------------------------------------------------------------------
@@ -828,6 +881,36 @@ def _compute_jacobian(
         base_vals[f"{esc}__curr"] = ss_val
         base_vals[f"{esc}__lag"] = ss_val
         base_vals[f"{esc}__ss"] = ss_val
+
+    # Dynare symbolically differentiates min/max using the active branch at the
+    # steady state, choosing the second argument at a tie. Resolve those
+    # branches before finite differencing so a kink is never averaged to 0.5.
+    branch_env = _build_bk_env(base_vals)
+    selected_local_var_defs: List[Tuple[str, str]] = []
+    for local_name, local_expr in local_var_defs:
+        selected_expr = _select_dynare_min_max_derivative_branches(
+            local_expr,
+            branch_env,
+        )
+        val, err = _safe_eval_expr(selected_expr, branch_env)
+        if val is None or err:
+            raise ValueError(
+                f"failed to evaluate model-local variable '{local_name}': {err}",
+            )
+        branch_env[_escape_reserved(local_name)] = val
+        selected_local_var_defs.append((local_name, selected_expr))
+    local_var_defs = selected_local_var_defs
+    prepared_equations = [
+        (
+            _select_dynare_min_max_derivative_branches(lhs, branch_env),
+            (
+                _select_dynare_min_max_derivative_branches(rhs, branch_env)
+                if rhs is not None
+                else None
+            ),
+        )
+        for lhs, rhs in prepared_equations
+    ]
 
     # Initialize Jacobian matrices
     f_yp = np.zeros((n_eq, n_var))
@@ -1175,7 +1258,9 @@ def _generalized_eigenvalues(
     for a, b in zip(alpha, beta):
         if b == 0:
             if a == 0:
-                eigenvalues.append(complex(np.nan, np.nan))
+                raise ValueError(
+                    "singular 0/0 generalized eigenvalue (alpha=beta=0)",
+                )
             else:
                 eigenvalues.append(complex(np.inf, 0.0))
         else:
@@ -1404,7 +1489,18 @@ def check_blanchard_kahn(
             predetermined_variables=predetermined_vars,
         )
 
-    eigenvalues = _generalized_eigenvalues(alpha, beta)
+    try:
+        eigenvalues = _generalized_eigenvalues(alpha, beta)
+    except ValueError as e:
+        return BKResult(
+            satisfied=False,
+            n_unstable=0,
+            n_forward=n_forward,
+            eigenvalues=[],
+            message=f"Blanchard-Kahn check skipped: {e}.",
+            forward_variables=forward_vars,
+            predetermined_variables=predetermined_vars,
+        )
     n_unstable = int(np.count_nonzero(_is_explosive(alpha, beta)))
 
     # BK condition: n_unstable == n_forward

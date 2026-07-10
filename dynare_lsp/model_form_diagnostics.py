@@ -26,7 +26,7 @@ from .parser import (
     _offset_to_position,
     _strip_comments,
 )
-from .steady_state import _prepare_ss_expression
+from .steady_state import _LOCAL_VAR_DEF, _prepare_ss_expression
 
 _FALLBACK_RANGE = SourceRange(Position(0, 0), Position(0, 1))
 
@@ -197,6 +197,14 @@ def _check_steady_state_model(
 
 def _balanced_arg(text: str, open_idx: int) -> Optional[str]:
     """Return the substring inside the parentheses opened at *open_idx*."""
+    close_idx = _balanced_close(text, open_idx)
+    if close_idx is None:
+        return None
+    return text[open_idx + 1 : close_idx]
+
+
+def _balanced_close(text: str, open_idx: int) -> Optional[int]:
+    """Return the matching close-parenthesis index for *open_idx*."""
     depth = 0
     for i in range(open_idx, len(text)):
         char = text[i]
@@ -205,8 +213,31 @@ def _balanced_arg(text: str, open_idx: int) -> Optional[str]:
         elif char == ")":
             depth -= 1
             if depth == 0:
-                return text[open_idx + 1 : i]
+                return i
     return None
+
+
+_STEADY_STATE_CALL_RE = re.compile(r"\bsteady_state\s*\(", re.IGNORECASE)
+
+
+def _mask_steady_state_calls(expr: str) -> str:
+    """Replace steady-state operators by opaque constants for linearity checks."""
+    pieces: List[str] = []
+    cursor = 0
+    while True:
+        match = _STEADY_STATE_CALL_RE.search(expr, cursor)
+        if match is None:
+            break
+        close_idx = _balanced_close(expr, match.end() - 1)
+        if close_idx is None:
+            break
+        pieces.append(expr[cursor : match.start()])
+        # ``None`` parses as an AST constant but is not mistaken for a literal
+        # exponent of zero or one.
+        pieces.append("None")
+        cursor = close_idx + 1
+    pieces.append(expr[cursor:])
+    return "".join(pieces)
 
 
 def _check_linear_model(
@@ -219,21 +250,23 @@ def _check_linear_model(
 
     diagnostics: List[Diagnostic] = []
     seen: Set[Tuple[int, str]] = set()
+    variable_aliases = set(variables)
     # Scan all model equations, including model-local ``#`` definitions: a
     # ``# z = abs(y);`` or ``# z = y*k;`` in a linear model is just as invalid,
     # and Dynare rejects it (the preprocessor error is line-less, so the LSP
     # would otherwise show nothing). ``dynamic_model_equations()`` excludes
     # ``#`` defs, so iterate the full list here.
     for equation in model.model_equations:
-        if equation.text.strip().startswith("#"):
-            exprs = [equation.text.split("=", 1)[1]] if "=" in equation.text else []
+        local_match = _LOCAL_VAR_DEF.match(equation.text.strip())
+        if local_match:
+            exprs = [local_match.group(2)]
         elif equation.rhs:
             exprs = [equation.lhs, equation.rhs]
         else:
             exprs = [equation.text]
 
         for expr in exprs:
-            operator = _linear_nonlinear_operator(expr, variables)
+            operator = _linear_nonlinear_operator(expr, variable_aliases)
             if operator is None:
                 continue
             key = (equation.range.start.line, operator)
@@ -255,13 +288,19 @@ def _check_linear_model(
                 )
             )
             break
+        if local_match and _expression_has_variable(
+            local_match.group(2),
+            variable_aliases,
+        ):
+            variable_aliases.add(local_match.group(1))
     return diagnostics
 
 
 def _linear_nonlinear_operator(expr: str, variables: Set[str]) -> Optional[str]:
     """Return the first nonlinear operator applied to model variables."""
-    for match in _NONLINEAR_FUNC_RE.finditer(expr):
-        arg = _balanced_arg(expr, match.end() - 1)
+    analysis_expr = _mask_steady_state_calls(expr)
+    for match in _NONLINEAR_FUNC_RE.finditer(analysis_expr):
+        arg = _balanced_arg(analysis_expr, match.end() - 1)
         if arg is None:
             continue
         # Applying the operator to a constant/parameter keeps the model
@@ -270,12 +309,23 @@ def _linear_nonlinear_operator(expr: str, variables: Set[str]) -> Optional[str]:
             continue
         return match.group(1).lower()
 
-    prepared = _prepare_ss_expression(expr.rstrip(";").strip())
+    prepared = _prepare_ss_expression(analysis_expr.rstrip(";").strip())
     try:
         tree = ast.parse(prepared, mode="eval")
     except SyntaxError:
         return None
     return _nonlinear_operator_in_node(tree.body, variables)
+
+
+def _expression_has_variable(expr: str, variables: Set[str]) -> bool:
+    prepared = _prepare_ss_expression(
+        _mask_steady_state_calls(expr).rstrip(";").strip()
+    )
+    try:
+        tree = ast.parse(prepared, mode="eval")
+    except SyntaxError:
+        return False
+    return _node_has_variable(tree.body, variables)
 
 
 def _nonlinear_operator_in_node(

@@ -660,8 +660,7 @@ def _map_diagnostic_to_original_source(
         return diagnostic
 
     macro_spans = [
-        (m.start(), m.end())
-        for m in re.finditer(r"@\{[A-Za-z_][A-Za-z0-9_]*\}", original_text)
+        (m.start(), m.end()) for m in re.finditer(r"@\{[^{}\n]+\}", original_text)
     ]
 
     def _map_pos(pos: Position) -> Position:
@@ -757,7 +756,6 @@ _BUILTINS = frozenset(
         "erf",
         "erfc",
         # Constants
-        "pi",
         "inf",
         "nan",
         # Dynare operators / keywords used inside equations
@@ -834,13 +832,6 @@ _RESERVED_BLOCK_KEYWORDS = frozenset(
 )
 
 
-# Names that this LSP treats as math constants/functions when evaluating
-# expressions, but that Dynare does NOT reserve in its lexer and therefore
-# permits as user identifiers.  ``pi`` is the canonical case: it is the
-# inflation variable across the New-Keynesian literature, and Dynare has no
-# built-in ``pi`` constant, so declaring ``var pi;`` is valid.
-_DECLARABLE_BUILTINS = {"pi"}
-
 # Function-like operators Dynare's lexer reserves inside model expressions:
 # declaring or assigning them parses as a malformed function call
 # ("syntax error, unexpected EQUAL, expecting '('").
@@ -849,8 +840,6 @@ _EXPRESSION_OPERATOR_RESERVED = {"var_expectation", "pac_target_nonstationary"}
 
 def _reserved_identifier_reason(name: str) -> Optional[str]:
     lowered = name.lower()
-    if lowered in _DECLARABLE_BUILTINS:
-        return None
     if lowered in _BUILTINS:
         return "Dynare built-in function or operator"
     if lowered in _EXPRESSION_OPERATOR_RESERVED:
@@ -1338,20 +1327,182 @@ def _filter_include_closed_parse_errors(
     return filtered
 
 
+def _nested_include_anchor(
+    parent_anchor: SourceRange,
+    directive_range: SourceRange,
+) -> SourceRange:
+    """Mirror the workspace's synthetic ordering range for a nested include."""
+    base_line = parent_anchor.start.line
+    base_char = parent_anchor.start.character
+
+    def shift(pos: Position) -> Position:
+        return Position(base_line, base_char + pos.line * 10000 + pos.character)
+
+    return SourceRange(shift(directive_range.start), shift(directive_range.end))
+
+
+def _include_model_sources(
+    root_model: ParsedModel,
+    include_models: Optional[List[ParsedModel]],
+) -> Dict[int, Tuple[str, int]]:
+    """Map included model identities to ``(filename, depth)``.
+
+    ``resolve_all_includes`` emits descendants before their parent.  Using that
+    ordering matters when a nested include is on line zero: its synthetic anchor
+    can be identical to the parent's root anchor, so ranges alone are ambiguous.
+    """
+    models = list(include_models or [])
+    if not models:
+        return {}
+
+    sources: Dict[int, Tuple[str, int]] = {}
+    unassigned = set(range(len(models)))
+
+    def assign_child(
+        expected_anchor: SourceRange,
+        filename: str,
+        depth: int,
+        before_index: int,
+    ) -> None:
+        candidates: List[int] = []
+        for index in unassigned:
+            anchor = models[index].include_anchor_range
+            if (
+                index < before_index
+                and anchor is not None
+                and _range_key(anchor) == _range_key(expected_anchor)
+            ):
+                candidates.append(index)
+        if not candidates:
+            return
+        child_index = max(candidates)
+        sources[id(models[child_index])] = (filename, depth)
+        unassigned.remove(child_index)
+
+    for directive in reversed(root_model.includes):
+        assign_child(
+            directive.range,
+            directive.filename,
+            1,
+            len(models),
+        )
+
+    for parent_index in range(len(models) - 1, -1, -1):
+        parent = models[parent_index]
+        source = sources.get(id(parent))
+        anchor = parent.include_anchor_range
+        if source is None or anchor is None:
+            continue
+        _filename, parent_depth = source
+        for directive in reversed(parent.includes):
+            assign_child(
+                _nested_include_anchor(anchor, directive.range),
+                directive.filename,
+                parent_depth + 1,
+                parent_index,
+            )
+
+    return sources
+
+
 def _check_included_parse_errors(
+    root_model: ParsedModel,
     include_models: Optional[List[ParsedModel]],
 ) -> List[Diagnostic]:
     diagnostics: List[Diagnostic] = []
+    sources = _include_model_sources(root_model, include_models)
     for include_model in include_models or []:
+        source = sources.get(id(include_model))
+        prefix = (
+            f"Included file error in '{source[0]}': "
+            if source is not None
+            else "Included file error: "
+        )
         for diagnostic in _check_parse_errors(include_model):
             diagnostics.append(
                 replace(
                     diagnostic,
-                    message=f"Included file error: {diagnostic.message}",
+                    message=f"{prefix}{diagnostic.message}",
                     fix=None,
                 )
             )
     return diagnostics
+
+
+def _include_model_owned_ranges(model: ParsedModel) -> List[SourceRange]:
+    ranges = [
+        declaration.range
+        for declaration in (
+            list(model.endogenous)
+            + list(model.exogenous)
+            + list(model.deterministic_exogenous)
+            + list(model.parameters)
+            + list(model.predetermined_variables)
+        )
+    ]
+    ranges.extend(
+        item.range
+        for item in (
+            list(model.model_equations)
+            + list(model.steady_state_equations)
+            + list(model.param_assignments)
+            + list(model.helper_assignments)
+            + list(model.initval_entries)
+            + list(model.endval_entries)
+        )
+    )
+    ranges.extend(error[1] for error in model.errors)
+    ranges.extend(
+        entry.range for entry in model.estimated_params if entry.range is not None
+    )
+    return ranges
+
+
+def _label_nested_include_diagnostics(
+    root_model: ParsedModel,
+    include_models: Optional[List[ParsedModel]],
+    diagnostics: List[Diagnostic],
+) -> List[Diagnostic]:
+    """Add the originating filename to diagnostics from nested include content."""
+    sources = _include_model_sources(root_model, include_models)
+    candidates = [
+        (
+            include_model,
+            source_name,
+            depth,
+            _include_model_owned_ranges(include_model),
+        )
+        for include_model in include_models or []
+        if (source := sources.get(id(include_model))) is not None
+        for source_name, depth in [source]
+        if depth > 1
+    ]
+    if not candidates:
+        return diagnostics
+
+    labeled: List[Diagnostic] = []
+    for diagnostic in diagnostics:
+        if diagnostic.code in {"E060", "E061"} or diagnostic.message.startswith(
+            "Included file error"
+        ):
+            labeled.append(diagnostic)
+            continue
+        matches = [
+            (depth, source_name)
+            for _include_model, source_name, depth, owned_ranges in candidates
+            if any(
+                _ranges_nested_or_equal(owned_range, diagnostic.range)
+                for owned_range in owned_ranges
+            )
+        ]
+        if matches:
+            _depth, source_name = max(matches, key=lambda item: item[0])
+            diagnostic = replace(
+                diagnostic,
+                message=f"In included file '{source_name}': {diagnostic.message}",
+            )
+        labeled.append(diagnostic)
+    return labeled
 
 
 _DECL_INVALID_IDENT_PATTERN = re.compile(
@@ -1528,23 +1679,127 @@ def _check_timed_deterministic_exogenous(model: ParsedModel) -> List[Diagnostic]
     return diagnostics
 
 
+_MODEL_LOCAL_DEFINITION_RE = re.compile(r"#\s*([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _model_local_name(equation) -> Optional[str]:
+    match = _MODEL_LOCAL_DEFINITION_RE.match(equation.text.strip())
+    return match.group(1) if match else None
+
+
 def _check_model_local_shadowing(model: ParsedModel) -> List[Diagnostic]:
-    """Reject model-local ``#`` names that shadow declared Dynare symbols."""
+    """Validate model-local ``#`` declaration order and conflicts."""
     diagnostics: List[Diagnostic] = []
     declared = model.all_declared_names()
-    if not declared:
-        return diagnostics
+    model_equations = sorted(
+        model.model_equations,
+        key=lambda eq: (
+            eq.range.start.line,
+            eq.range.start.character,
+            eq.range.end.line,
+            eq.range.end.character,
+        ),
+    )
 
-    seen: set[str] = set()
-    for eq in list(model.model_equations) + list(model.steady_state_equations):
-        match = re.match(r"#\s*([A-Za-z_][A-Za-z0-9_]*)", eq.text.strip())
-        if not match:
+    seen_definitions: Dict[str, Position] = {}
+    seen_shadowing: set[str] = set()
+    for equation in model_equations:
+        name = _model_local_name(equation)
+        if name is None:
             continue
-        name = match.group(1)
-        if name not in declared or name in seen:
+        rng = (
+            _find_reference_range_in_equation(model.text, equation.range, name)
+            or equation.range
+        )
+        if name in seen_definitions:
+            diagnostics.append(
+                Diagnostic(
+                    range=rng,
+                    severity=Severity.ERROR,
+                    message=(
+                        f"Model-local variable '{name}' is declared twice. "
+                        "Fix: remove the duplicate # definition or give it a "
+                        "different name."
+                    ),
+                    code="E030",
+                )
+            )
+        else:
+            seen_definitions[name] = equation.range.start
+
+        if name in declared and name not in seen_shadowing:
+            seen_shadowing.add(name)
+            diagnostics.append(
+                Diagnostic(
+                    range=rng,
+                    severity=Severity.ERROR,
+                    message=(
+                        f"Model-local variable '{name}' shadows a declared Dynare "
+                        "symbol. Fix: rename the model-local variable or remove the "
+                        "duplicate declaration."
+                    ),
+                    code="E025",
+                )
+            )
+
+    # A pound variable becomes available only after its definition.  Keep this
+    # distinct from E020 so the diagnostic can name the missing ordering fix.
+    first_definition = dict(seen_definitions)
+    visible_locals: set[str] = set()
+    seen_early_uses: set[str] = set()
+    for equation in model_equations:
+        local_name = _model_local_name(equation)
+        references = _extract_equation_references(equation, declared)
+        if local_name is not None:
+            try:
+                references.remove(local_name)
+            except ValueError:
+                pass
+        for name in references:
+            definition = first_definition.get(name)
+            if (
+                definition is None
+                or name in visible_locals
+                or name in declared
+                or name in seen_early_uses
+            ):
+                continue
+            use_position = equation.range.start
+            if (
+                use_position.line,
+                use_position.character,
+            ) >= (definition.line, definition.character):
+                continue
+            seen_early_uses.add(name)
+            rng = (
+                _find_reference_range_in_equation(model.text, equation.range, name)
+                or equation.range
+            )
+            diagnostics.append(
+                Diagnostic(
+                    range=rng,
+                    severity=Severity.ERROR,
+                    message=(
+                        f"Model-local variable '{name}' is used before its # "
+                        "definition. Fix: move the definition above this use."
+                    ),
+                    code="E025",
+                )
+            )
+        if local_name is not None:
+            visible_locals.add(local_name)
+
+    # ``#`` is invalid in steady_state_model when it reuses a declared symbol;
+    # preserve the existing diagnostic for that parser-recovery case.
+    for equation in model.steady_state_equations:
+        name = _model_local_name(equation)
+        if name is None or name not in declared or name in seen_shadowing:
             continue
-        seen.add(name)
-        rng = _find_reference_range_in_equation(model.text, eq.range, name) or eq.range
+        seen_shadowing.add(name)
+        rng = (
+            _find_reference_range_in_equation(model.text, equation.range, name)
+            or equation.range
+        )
         diagnostics.append(
             Diagnostic(
                 range=rng,
@@ -1641,28 +1896,76 @@ def _check_undeclared_references(
     """
     diagnostics: List[Diagnostic] = []
     local_declared = model.all_declared_names()
-    declared = set(local_declared)
+    declarations = (
+        list(model.endogenous)
+        + list(model.exogenous)
+        + list(model.deterministic_exogenous)
+        + list(model.parameters)
+        + list(model.predetermined_variables)
+    )
+    always_visible_includes: set[str] = set()
     if include_symbols is not None:
         for kind in ("endogenous", "exogenous", "parameters"):
             for v in include_symbols.get(kind, []):
-                declared.add(v.name)
+                if model.include_context is not None or v.name not in local_declared:
+                    # Callers that supply symbols without include models do not
+                    # provide an include-site range.  Contextualized active
+                    # include files likewise use their own source coordinates,
+                    # which cannot be ordered against the parent's ranges.
+                    always_visible_includes.add(v.name)
     shocks_var_set = set(model.shocks_vars)
     # Names with value assignments (param or helper) → likely parameters
     assigned_names = {a.name for a in model.param_assignments} | {
         a.name for a in model.helper_assignments
     }
 
-    # Model-local variables are scoped to the whole model block, not only
-    # equations textually after the ``#`` definition.
-    local_vars: set = set()
-    for eq in model.model_equations:
-        match = re.match(r"#\s*([A-Za-z_][A-Za-z0-9_]*)", eq.text.strip())
-        if match:
-            local_vars.add(match.group(1))
+    model_block_ranges = model.model_block_ranges or (
+        [model.model_block_range] if model.model_block_range is not None else []
+    )
+    on_the_fly_names = {
+        declaration.name
+        for declaration in declarations
+        if any(
+            _ranges_nested_or_equal(block_range, declaration.range)
+            for block_range in model_block_ranges
+        )
+    }
+    # E025 handles use-before-definition for pound variables.  Excluding every
+    # pound name here prevents a second, less-specific E020 for the same use.
+    local_vars = {
+        name
+        for equation in model.model_equations
+        if (name := _model_local_name(equation)) is not None
+    }
     seen_undeclared: set = set()  # avoid duplicate reports for same identifier
 
-    for eq in model.model_equations:
-        refs = _extract_equation_references(eq)
+    for eq in sorted(
+        model.model_equations,
+        key=lambda item: (
+            item.range.start.line,
+            item.range.start.character,
+            item.range.end.line,
+            item.range.end.character,
+        ),
+    ):
+        equation_position = (eq.range.start.line, eq.range.start.character)
+        declared = set(always_visible_includes) | set(on_the_fly_names)
+        declared.update(
+            declaration.name
+            for declaration in declarations
+            if (
+                declaration.range.start.line,
+                declaration.range.start.character,
+            )
+            <= equation_position
+        )
+        refs = _extract_equation_references(eq, declared)
+        local_name = _model_local_name(eq)
+        if local_name is not None:
+            try:
+                refs.remove(local_name)
+            except ValueError:
+                pass
         for ref in refs:
             if ref not in declared and ref not in local_vars:
                 ref_range = _find_reference_range_in_equation(
@@ -3684,6 +3987,7 @@ def _check_included_stray_equations(
 def _check_circular_includes(
     model: ParsedModel,
     cycles: List[List[str]],
+    include_models: Optional[List[ParsedModel]] = None,
 ) -> List[Diagnostic]:
     """Emit ``E060`` for each cycle in the include graph touching this file.
 
@@ -3698,32 +4002,76 @@ def _check_circular_includes(
     if not cycles:
         return diagnostics
 
-    for cycle in cycles:
-        # Render the cycle in a compact, human-readable form.
-        from pathlib import Path as _P
+    from pathlib import Path as _P
 
+    source_text = getattr(model, "original_text", "") or model.text
+    _defines, active_lines, _line_defines = _macro_branch_state(source_text)
+    active_root_includes = [
+        directive
+        for directive in model.includes
+        if directive.range.start.line >= len(active_lines)
+        or active_lines[directive.range.start.line]
+    ]
+
+    def target_matches_cycle(filename: str, cycle: List[str]) -> bool:
+        target_parts = _P(filename.replace("\\", "/")).parts
+        return any(
+            len(target_parts) <= len(_P(path).parts)
+            and _P(path).parts[-len(target_parts) :] == target_parts
+            for path in cycle
+        )
+
+    def root_directive_for_anchor(anchor: SourceRange) -> Optional[IncludeDirective]:
+        candidates = [
+            directive
+            for directive in active_root_includes
+            if directive.range.start.line == anchor.start.line
+        ]
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda directive: abs(
+                directive.range.start.character - anchor.start.character
+            ),
+        )
+
+    for cycle in cycles:
         names = [_P(p).name for p in cycle]
         chain = " -> ".join(names)
         directive_range = SourceRange(Position(0, 0), Position(0, 1))
-        source_text = getattr(model, "original_text", "") or model.text
-        _defines, active_lines, _line_defines = _macro_branch_state(source_text)
-        for directive in model.includes:
-            if (
-                directive.range.start.line < len(active_lines)
-                and not active_lines[directive.range.start.line]
-            ):
-                continue
-            target_parts = _P(directive.filename.replace("\\", "/")).parts
-            if any(
-                len(target_parts) <= len(_P(path).parts)
-                and _P(path).parts[-len(target_parts) :] == target_parts
-                for path in cycle
-            ):
+        for directive in active_root_includes:
+            if target_matches_cycle(directive.filename, cycle):
                 directive_range = directive.range
                 break
         else:
-            if model.includes:
-                directive_range = model.includes[0].range
+            # A cycle can begin below a non-cyclic root include.  Included
+            # models retain the root edge's line in their synthetic anchor, so
+            # trace any edge touching the cycle back to that visible directive.
+            for include_model in include_models or []:
+                anchor = include_model.include_anchor_range
+                if anchor is None:
+                    continue
+                include_source = include_model.original_text or include_model.text
+                _inc_defines, inc_active, _inc_line_defines = _macro_branch_state(
+                    include_source
+                )
+                if not any(
+                    (
+                        directive.range.start.line >= len(inc_active)
+                        or inc_active[directive.range.start.line]
+                    )
+                    and target_matches_cycle(directive.filename, cycle)
+                    for directive in include_model.includes
+                ):
+                    continue
+                root_directive = root_directive_for_anchor(anchor)
+                if root_directive is not None:
+                    directive_range = root_directive.range
+                    break
+            else:
+                if active_root_includes:
+                    directive_range = active_root_includes[0].range
         diagnostics.append(
             Diagnostic(
                 range=directive_range,
@@ -3893,16 +4241,16 @@ def _check_unmatched_macro_blocks(model: ParsedModel) -> List[Diagnostic]:
     if had_mismatch:
         return diagnostics
 
-    # A closer may sit inside a ``/* */`` block comment, which comment
-    # stripping removed before macro-directive extraction.  Dynare's macro
-    # processor pairs ``@#for``/``@#endfor`` (and ``@#if``/``@#endif``)
-    # regardless of comments, so if the raw source is balanced for an opener's
-    # kind, the block is in fact closed -- don't report it as unterminated.
+    # Retain the count fallback for parser-recovery cases. Dynare's macro layer
+    # has one awkward but important ordering rule: a directive that starts its
+    # own line inside an already-open ``/* ... */`` block is still processed.
+    # Anchoring at the start of a line reproduces that behavior without letting
+    # inline block comments, line comments, or string literals close a block.
     raw = getattr(model, "original_text", "") or model.text
-    raw_for = len(re.findall(r"(?<!\w)@#\s*for\b", raw))
-    raw_endfor = len(re.findall(r"(?<!\w)@#\s*endfor\b", raw))
-    raw_if = len(re.findall(r"(?<!\w)@#\s*(?:if|ifdef|ifndef)\b", raw))
-    raw_endif = len(re.findall(r"(?<!\w)@#\s*endif\b", raw))
+    raw_for = len(re.findall(r"(?m)^[ \t]*@#\s*for\b", raw))
+    raw_endfor = len(re.findall(r"(?m)^[ \t]*@#\s*endfor\b", raw))
+    raw_if = len(re.findall(r"(?m)^[ \t]*@#\s*(?:if|ifdef|ifndef)\b", raw))
+    raw_endif = len(re.findall(r"(?m)^[ \t]*@#\s*endif\b", raw))
     for_balanced = raw_endfor >= raw_for
     if_balanced = raw_endif >= raw_if
 
@@ -3974,10 +4322,49 @@ _MACRO_INTERPOLATION_EXPR_PATTERN = re.compile(r"@\{([^{}\n]+)\}")
 _MACRO_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
-def _known_macro_names(model: ParsedModel) -> set:
-    """Names introduced by ``@#define`` / ``@#for`` anywhere in the file."""
-    known: set = set()
+MacroNameState = Tuple[
+    Dict[str, str],
+    List[bool],
+    Dict[int, Dict[str, str]],
+    Dict[int, MacroBranchSignature],
+]
+
+
+def _macro_name_state(model: ParsedModel) -> MacroNameState:
+    source = model.original_text or model.text
+    final_defines, active_lines, line_defines = _macro_branch_state(source)
+    return (
+        final_defines,
+        active_lines,
+        line_defines,
+        _macro_branch_signatures_by_line(model),
+    )
+
+
+def _known_macro_names(
+    model: ParsedModel,
+    before_line: int,
+    state: Optional[MacroNameState] = None,
+) -> set[str]:
+    """Names visible before *before_line* in active macro scope."""
+    final_defines, active_lines, line_defines, signatures = (
+        state if state is not None else _macro_name_state(model)
+    )
+    known = set(
+        final_defines
+        if before_line >= len(active_lines)
+        else line_defines.get(before_line, {})
+    )
+    use_signature = signatures.get(before_line, tuple())
     for directive in model.macro_directives:
+        directive_line = directive.range.start.line
+        if directive_line >= before_line:
+            continue
+        if directive_line < len(active_lines) and not active_lines[directive_line]:
+            continue
+        directive_signature = signatures.get(directive_line, tuple())
+        if any(frame not in use_signature for frame in directive_signature):
+            continue
         argument = directive.argument or ""
         if directive.kind == "define":
             m = re.match(r"\s*([A-Za-z_]\w*)", argument)
@@ -4085,9 +4472,9 @@ def _check_unresolved_macro_interpolations(
     already substituted every interpolation the LSP's macro engine can
     resolve — anything still matching ``@{...}`` here is unresolved.
     Identifiers inside string literals and Dynare macro built-ins are not
-    names at all; a name introduced by a ``@#define`` / ``@#for`` in this
-    file is treated as known (the directive may simply be beyond the
-    simple evaluator — the real preprocessor still validates on save).
+    names at all; a name introduced by a prior active ``@#define`` or an
+    enclosing ``@#for`` is treated as known even when its value is beyond the
+    simple evaluator.
     An interpolation is flagged when it contains at least one definitely
     unknown name; expression interpolations additionally require the file
     to have no ``@#include`` that could provide unseen defines.
@@ -4095,11 +4482,26 @@ def _check_unresolved_macro_interpolations(
     diagnostics: List[Diagnostic] = []
     text = _strip_non_macro_comments(model.text)
     lines = text.splitlines()
-    known = _known_macro_names(model)
-    # Names @#define'd / @#for-bound in included files are visible at the
-    # point of use even when their VALUES are beyond the simple evaluator.
+    macro_state = _macro_name_state(model)
+    _final_defines, active_lines, _line_defines, _signatures = macro_state
+    included_names: List[Tuple[Position, set[str]]] = []
     for include_model in include_models or []:
-        known |= _known_macro_names(include_model)
+        anchor = include_model.include_anchor_range
+        if anchor is None:
+            continue
+        line = anchor.start.line
+        if line < len(active_lines) and not active_lines[line]:
+            continue
+        include_state = _macro_name_state(include_model)
+        include_end = len(
+            (include_model.original_text or include_model.text).splitlines()
+        )
+        included_names.append(
+            (
+                anchor.start,
+                _known_macro_names(include_model, include_end, include_state),
+            )
+        )
     has_includes = bool(model.includes)
 
     for match in _MACRO_INTERPOLATION_EXPR_PATTERN.finditer(text):
@@ -4107,6 +4509,11 @@ def _check_unresolved_macro_interpolations(
         line = lines[start.line] if 0 <= start.line < len(lines) else ""
         if line.lstrip().startswith("@#"):
             continue
+        known = _known_macro_names(model, start.line, macro_state)
+        use_position = (start.line, start.character)
+        for anchor, names in included_names:
+            if (anchor.line, anchor.character) < use_position:
+                known.update(names)
         expr = match.group(1).strip()
         # ``defined(NAME)`` queries whether NAME exists — its argument is
         # legitimately allowed to be undefined, and a guarded short-circuit
@@ -4326,6 +4733,7 @@ def run_diagnostics(
     single-file signature stays backwards-compatible.
     """
     diagnostics: List[Diagnostic] = []
+    has_unresolved_includes = bool(unresolved_includes)
     context_model = model_with_include_context(
         model,
         include_models,
@@ -4398,7 +4806,9 @@ def run_diagnostics(
     # Phase 0: Cross-file structural — circular includes always reported,
     # regardless of the single-file structural state.
     if include_cycles:
-        diagnostics.extend(_check_circular_includes(model, include_cycles))
+        diagnostics.extend(
+            _check_circular_includes(model, include_cycles, include_models)
+        )
     if unresolved_includes:
         diagnostics.extend(_check_unresolved_includes(unresolved_includes))
     # Unmatched @#if / @#for run from the parsed macro directives — no
@@ -4412,7 +4822,7 @@ def run_diagnostics(
     parse_errors = _check_parse_errors(model)
     parse_errors = _filter_include_closed_parse_errors(parse_errors, include_models)
     parse_errors.extend(_check_invalid_identifier_declarations(model))
-    parse_errors.extend(_check_included_parse_errors(include_models))
+    parse_errors.extend(_check_included_parse_errors(model, include_models))
     diagnostics.extend(parse_errors)
     # Also check for merged equations (missing semicolons within model block),
     # including model fragments that came from textual includes.
@@ -4493,6 +4903,7 @@ def run_diagnostics(
             or has_macro_branch_decl_alternatives
             or has_macro_for_templates
             or has_unresolved_interpolations
+            or has_unresolved_includes
         )
         if equation_count_unreliable:
             eq_count_diags = []
@@ -4506,10 +4917,11 @@ def run_diagnostics(
             reference_model,
             include_symbols,
         )
-        if has_unresolved_interpolations:
+        if has_unresolved_interpolations or has_unresolved_includes:
             # Dropped/mangled declarations make undeclared-name results
-            # guesses (``var z@{"a"};`` would flag za as a typo); the
-            # preprocessor arbitrates on save.
+            # guesses (``var z@{"a"};`` would flag za as a typo).  A missing
+            # include can likewise supply declarations that are currently
+            # invisible; the include error is the actionable root cause.
             undeclared_diags = []
 
         # Link E010 + E020 when they point to the same root cause:
@@ -4851,6 +5263,19 @@ def run_diagnostics(
         diagnostics.extend(_check_exogenous_in_initval(context_model))
         diagnostics.extend(_check_missing_initval(context_model))
         diagnostics.extend(_check_parameter_bounds(context_model))
+
+    if has_unresolved_includes:
+        diagnostics = [
+            diagnostic
+            for diagnostic in diagnostics
+            if diagnostic.code not in {"E010", "E020"}
+        ]
+
+    diagnostics = _label_nested_include_diagnostics(
+        model,
+        include_models,
+        diagnostics,
+    )
 
     # Cap total errors to avoid overwhelming LLM consumers
     MAX_ERRORS = 10

@@ -38,8 +38,8 @@ Suggested citation:
 
 ## Requirements
 
-- **Python 3.8+** for the core language server (**3.10+ for the MCP
-  server** — every release of the `mcp` package requires Python 3.10)
+- **Python 3.11+**
+- **VS Code 1.101+** when using the bundled extension
 - Optional, for the steady-state solver and identification checks:
   `numpy`, `scipy`, `sympy`
 - Optional, for the MCP server: the `mcp` package
@@ -60,10 +60,9 @@ cd LLMacro-Dynare-LSP
 pip install -e ".[all]"
 ```
 
-`".[all]"` pulls in the solver dependencies and the MCP server (and therefore
-needs Python 3.10+). On Python 3.8/3.9 use `pip install -e ".[solver]"` for
-the solver without MCP, or a plain `pip install -e .` for just the core
-language server.
+`".[all]"` pulls in the solver dependencies and the MCP server. Use
+`pip install -e ".[solver]"` for the solver without MCP, or a plain
+`pip install -e .` for just the core language server.
 
 Two console scripts are installed:
 
@@ -91,7 +90,7 @@ python -m dynare_lsp --explain --list
 Install the bundled extension from `vscode-dynare/`:
 
 1. In VS Code, open the Command Palette → **Extensions: Install from VSIX…**
-2. Select `vscode-dynare/dynare-lsp-0.3.1.vsix`.
+2. Select `vscode-dynare/dynare-lsp-0.4.0.vsix`.
 
 The extension launches the Python language server, so make sure the
 `dynare_lsp` package is installed in the Python environment VS Code uses
@@ -121,6 +120,28 @@ install the `dynare-lsp` plugin. Install the Python package with the MCP extra
 first so both `python -m dynare_lsp` and
 `python -m dynare_lsp.mcp_server` resolve in your environment.
 
+## Codex
+
+Codex can use the analysis engine through the MCP server. After installing the
+package with the MCP extra, add this to `~/.codex/config.toml` (or to a trusted
+project's `.codex/config.toml`):
+
+```toml
+[mcp_servers.dynare]
+command = "python"
+args = ["-m", "dynare_lsp.mcp_server"]
+```
+
+Alternatively, register it from the command line:
+
+```bash
+codex mcp add dynare -- python -m dynare_lsp.mcp_server
+codex mcp list
+```
+
+Pin `command` to the full interpreter path when `python` on `PATH` is not the
+environment where `dynare-lsp[mcp]` is installed.
+
 ## MCP server (standalone)
 
 To use the MCP server with any MCP client, run:
@@ -134,6 +155,9 @@ and — when MATLAB + Dynare are available — running a model end to end.
 
 ## License
 
-Provided as-is for research and educational use. The bundled Dynare
-preprocessor is distributed under Dynare's own license; see
-[dynare.org](https://www.dynare.org/).
+LLMacro Dynare LSP is licensed under the GNU General Public License v3.0 or
+later (`GPL-3.0-or-later`), matching the copyleft license inherited from Dynare.
+See `LICENSE` for the full terms. The bundled Dynare preprocessor remains
+subject to its upstream notices; the exact Dynare 7.1 copyright inventory and
+GPL text are also included as `dynare_lsp/bin/DYNARE_LICENSE.txt` and
+`dynare_lsp/bin/DYNARE_COPYING`. See [dynare.org](https://www.dynare.org/).

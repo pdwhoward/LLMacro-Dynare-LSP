@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import ast
 import logging
+import os
 import re
 import threading
 from dataclasses import replace
@@ -66,6 +67,17 @@ from .parser import (
 logger = logging.getLogger(__name__)
 
 
+def _path_key(path: Path) -> str:
+    """Return the canonical dictionary key for an absolute workspace path."""
+    try:
+        absolute = path.resolve()
+    except (OSError, RuntimeError):
+        # Keep virtual paths and temporarily unavailable UNC paths usable.
+        absolute = path.absolute()
+    # normcase folds case and separators on Windows and is an identity on POSIX.
+    return os.path.normcase(str(absolute))
+
+
 def _normalize_uri(uri_or_path: str) -> str:
     """Normalize a URI or path string to an absolute path string key.
 
@@ -73,13 +85,16 @@ def _normalize_uri(uri_or_path: str) -> str:
     paths.  Both forms must collapse to a single canonical key so the
     same physical file isn't tracked twice.
     """
-    p = _uri_to_path(uri_or_path)
-    try:
-        return str(p.resolve())
-    except (OSError, RuntimeError):
-        # On some platforms resolve() may fail on a non-existent path;
-        # fall back to a lexical absolute path.
-        return str(p.absolute())
+    return _path_key(_uri_to_path(uri_or_path))
+
+
+class _WorkspacePathKeys(set[str]):
+    """Workspace keys with normalized membership checks for virtual paths."""
+
+    def __contains__(self, value: object) -> bool:
+        if isinstance(value, str):
+            value = _normalize_uri(value)
+        return super().__contains__(value)
 
 
 class WorkspaceIndex:
@@ -1064,10 +1079,7 @@ class WorkspaceIndex:
         """Replace configured search paths scoped to workspace roots."""
         normalized: Dict[str, List[Path]] = {}
         for root, paths in paths_by_root.items():
-            try:
-                root_key = str(root.resolve())
-            except (OSError, RuntimeError):
-                root_key = str(root.absolute())
+            root_key = _path_key(root)
             deduped: List[Path] = []
             for path in paths:
                 if path not in deduped:
@@ -1166,7 +1178,7 @@ class WorkspaceIndex:
             logger.debug("Failed to read include %s: %s", path, exc)
             return None
         model = parse(text)
-        key = str(path.resolve())
+        key = _path_key(path)
         try:
             stat = path.stat()
             signature = (stat.st_mtime_ns, stat.st_size)
@@ -1344,7 +1356,7 @@ class WorkspaceIndex:
                     )
                     if resolved is None:
                         continue
-                    resolved_key = str(resolved)
+                    resolved_key = _path_key(resolved)
                     if emit_directives:
                         records.append((resolved_directive, resolved_key, context))
                     if resolved_key in stack_keys:
@@ -1829,11 +1841,11 @@ class WorkspaceIndex:
             )
             model_keys = list(self._models.keys())
             disk_loaded_keys = set(self._file_signatures.keys())
-        known_paths = {
+        known_paths = _WorkspacePathKeys(
             key
             for key in model_keys
             if key not in disk_loaded_keys or Path(key).is_file()
-        }
+        )
         search_paths = self._append_unique(search_paths, active_search_paths or [])
         return resolve_include_path(
             filename,
@@ -2040,7 +2052,7 @@ class WorkspaceIndex:
                     )
                     if resolved is None:
                         continue
-                    resolved_key = str(resolved)
+                    resolved_key = _path_key(resolved)
                     if resolved_key in stack_keys:
                         continue
 
@@ -2290,7 +2302,7 @@ class WorkspaceIndex:
                     )
                     if resolved is None:
                         continue
-                    resolved_key = str(resolved)
+                    resolved_key = _path_key(resolved)
                     if resolved_key in include_stack:
                         # Closed a cycle.  Record from the point of repetition.
                         idx = include_stack.index(resolved_key)
@@ -2483,7 +2495,7 @@ class WorkspaceIndex:
                                 )
                             )
                         continue
-                    resolved_key = str(resolved)
+                    resolved_key = _path_key(resolved)
                     if resolved_key in active_stack:
                         continue
                     nested_paths, nested_defines = _visit(
