@@ -9,13 +9,54 @@ Usage:
     python -m dynare_lsp --explain --list      # List all documented codes
 """
 
+from __future__ import annotations
+
 import argparse
 import sys
+from typing import TYPE_CHECKING, Any
 
 from .diagnostics import analyze_text
 from . import explain as _explain_module
 
+if TYPE_CHECKING:
+    from .parser import ParsedModel
+
 _MISSING_CHECK_FILE = "__DYNARE_LSP_MISSING_CHECK_FILE__"
+
+
+def _patch_pygls_windows_pipe() -> None:
+    """Fix pygls ``StdinAsyncReader.readexactly`` on Windows.
+
+    On Windows, ``BufferedReader.read(n)`` may return fewer than *n* bytes
+    before the pipe is fully drained.  pygls uses a single ``read(n)`` call
+    which can truncate large JSON-RPC messages (e.g. the LSP ``initialize``
+    request), causing ``JSONDecodeError`` and a failed server handshake.
+
+    This patch loops ``read()`` until exactly *n* bytes are received or the
+    stream is exhausted.
+    """
+    try:
+        import pygls.io_ as _pygls_io
+    except ImportError:
+        return
+
+    def _patched(self: Any, n: int) -> Any:
+        async def _read_exactly() -> bytes:
+            loop: Any = self.loop
+            executor: Any = self.executor
+            data = b""
+            while len(data) < n:
+                chunk: bytes = await loop.run_in_executor(
+                    executor, self.stdin.read, n - len(data)
+                )
+                if not chunk:
+                    break
+                data += chunk
+            return data
+
+        return _read_exactly()
+
+    _pygls_io.StdinAsyncReader.readexactly = _patched
 
 
 def main() -> None:
@@ -105,6 +146,8 @@ def main() -> None:
 
     import logging
     import os
+
+    _patch_pygls_windows_pipe()
 
     _log_path = os.path.join(os.path.expanduser("~"), "dynare_lsp.log")
     logging.basicConfig(
@@ -224,7 +267,7 @@ def _run_check(filepath: str, solve: bool = False) -> None:
         sys.exit(1)
 
 
-def _run_solve(text: str, filepath: str, model=None) -> None:
+def _run_solve(text: str, filepath: str, model: ParsedModel | None = None) -> None:
     """Compute the steady state and print results."""
     from .parser import parse
 
