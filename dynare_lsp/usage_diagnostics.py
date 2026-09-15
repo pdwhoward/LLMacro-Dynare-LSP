@@ -6,6 +6,7 @@ executed, surfaced statically so the LSP can flag them before a run:
   W120  a stochastic command (stoch_simul / estimation) with no exogenous
   W121  a parameter used with a lead/lag, e.g. ``beta(+1)``
   W122  a deep parameter assigned a non-finite value (NaN / Inf) before a run
+  W123  an endogenous variable absent at effective current period t
 
 All findings are warnings.  Each check returns nothing for a model that does
 not use the relevant construct, so an unrelated model gets zero new diagnostics.
@@ -15,6 +16,7 @@ from __future__ import annotations
 
 import math
 import re
+from copy import copy
 from dataclasses import replace
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -209,6 +211,7 @@ def check_usage(
         _check_no_exogenous(stripped, exogenous, deterministic_exogenous),
     )
     diagnostics.extend(_check_param_lead_lag(model, parameters))
+    diagnostics.extend(_check_missing_current_period(model, include_models))
     for include_model in include_models:
         include_stripped = _usage_text(include_model)
         diagnostics.extend(_anchor_include_diagnostics(
@@ -290,6 +293,79 @@ def _check_param_lead_lag(
             ))
     return diagnostics
 
+
+
+def _check_missing_current_period(
+    model: ParsedModel,
+    include_models: List[ParsedModel],
+) -> List[Diagnostic]:
+    """W123 -- endogenous variable never appears at effective period ``t``.
+
+    This mirrors Dynare's ``model_diagnostics`` structural timing check.  It
+    reports only the objective timing set observed after applying Dynare's
+    ``predetermined_variables`` convention; it never proposes which lead or
+    lag the author intended.
+    """
+    try:
+        from .bk_check import _extract_variable_timing
+    except Exception:
+        return []
+
+    merged = copy(model)
+    merged.model_equations = list(model.model_equations)
+    merged.endogenous = list(model.endogenous)
+    merged.predetermined_variables = list(model.predetermined_variables)
+
+    declaration_ranges: Dict[str, SourceRange] = {
+        decl.name: decl.range for decl in model.endogenous
+    }
+    seen_endogenous = {decl.name for decl in merged.endogenous}
+    seen_predetermined = {
+        decl.name for decl in merged.predetermined_variables
+    }
+
+    for include_model in include_models:
+        merged.model_equations.extend(include_model.model_equations)
+        anchor = include_model.include_anchor_range
+        for decl in include_model.endogenous:
+            if decl.name not in seen_endogenous:
+                merged.endogenous.append(decl)
+                seen_endogenous.add(decl.name)
+            declaration_ranges.setdefault(decl.name, anchor or decl.range)
+        for decl in include_model.predetermined_variables:
+            if decl.name not in seen_predetermined:
+                merged.predetermined_variables.append(decl)
+                seen_predetermined.add(decl.name)
+
+    if not merged.endogenous or not merged.dynamic_model_equations():
+        return []
+
+    try:
+        timing = _extract_variable_timing(merged)
+    except Exception:
+        return []
+
+    diagnostics: List[Diagnostic] = []
+    for decl in merged.endogenous:
+        offsets = sorted(timing.get(decl.name, set()))
+        if not offsets or 0 in offsets:
+            continue
+        rendered = ", ".join(
+            f"t{offset:+d}" if offset else "t" for offset in offsets
+        )
+        diagnostics.append(Diagnostic(
+            range=declaration_ranges.get(decl.name, decl.range),
+            severity=Severity.WARNING,
+            message=(
+                f"Endogenous variable '{decl.name}' never appears at effective "
+                f"current period t; observed timing: {rendered}. Dynare's "
+                "model_diagnostics flags this structure. Check the timing or "
+                "predetermined_variables declaration if this is unintended."
+            ),
+            source="dynare",
+            code="W123",
+        ))
+    return diagnostics
 
 def _check_nonfinite_params(
     model: ParsedModel,

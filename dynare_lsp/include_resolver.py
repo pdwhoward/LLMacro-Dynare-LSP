@@ -28,8 +28,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import unquote, urlparse
+
+from .performance import record_work
 
 
 def _uri_to_path(uri_or_path: str) -> Path:
@@ -69,6 +71,8 @@ def resolve_include_path(
     including_file_uri_or_path: str,
     search_paths: Optional[List[Path]] = None,
     known_paths: Optional[set] = None,
+    *,
+    known_only: bool = False,
 ) -> Optional[Path]:
     """Resolve the absolute path of a ``@#include`` target.
 
@@ -89,17 +93,21 @@ def resolve_include_path(
     *known_paths* should contain strings produced by
     :func:`dynare_lsp.workspace._normalize_uri` so the same normalisation
     rule applies on both sides of the comparison.
+    With *known_only*, only supplied paths participate, even when other
+    candidates exist on disk. This preserves supplied-only snapshot semantics.
     """
+    record_work("include_resolution.calls")
     if not directive_filename:
         return None
 
     known = known_paths or set()
 
     def _matches(p: Path) -> bool:
+        record_work("include_resolution.candidates")
         # A directory with the right name is NOT a Dynare include target,
         # so reject it explicitly; ``Path.exists()`` would otherwise
         # accept a folder called e.g. ``helper.mod``.
-        if p.is_file():
+        if not known_only and p.is_file():
             return True
         try:
             return str(p.resolve()) in known
@@ -107,6 +115,7 @@ def resolve_include_path(
             return False
 
     def _matches_known(p: Path) -> bool:
+        record_work("include_resolution.candidates")
         try:
             return str(p.resolve()) in known
         except (OSError, RuntimeError):
@@ -126,12 +135,13 @@ def resolve_include_path(
             return p.absolute()
 
     def _match_unique_known_relative_path(p: Path) -> Optional[Path]:
+        record_work("include_resolution.known_paths_scanned", len(known))
         target_parts = p.parts
         matches: List[Path] = []
         seen: set[str] = set()
         for entry in known:
             known_path = _uri_to_path(entry)
-            if known_path.is_file():
+            if not known_only and known_path.is_file():
                 continue
             known_parts = known_path.parts
             if len(known_parts) < len(target_parts):
@@ -161,7 +171,7 @@ def resolve_include_path(
 
     including_path = _uri_to_path(including_file_uri_or_path)
     # If the URI points to a file, use its parent; otherwise use it as-is.
-    if including_path.is_file() or including_path.suffix:
+    if known_only or including_path.is_file() or including_path.suffix:
         including_dir = including_path.parent
     else:
         including_dir = including_path
@@ -198,6 +208,139 @@ def resolve_include_path(
         return known_match
 
     return None
+
+
+def _resolved_path(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except (OSError, RuntimeError):
+        return path.absolute()
+
+
+def _paths_equal(left: Path, right: Path) -> bool:
+    return os.path.normcase(str(_resolved_path(left))) == os.path.normcase(
+        str(_resolved_path(right))
+    )
+
+
+def trace_include_path(
+    directive_filename: str,
+    including_file_uri_or_path: str,
+    search_paths: Optional[List[Path]] = None,
+    known_paths: Optional[set] = None,
+) -> Dict[str, Any]:
+    """Explain how :func:`resolve_include_path` searched for one include.
+
+    The ordinary resolver remains the source of truth.  This helper calls it
+    once, then reconstructs the same candidate order for user-facing
+    diagnostics without adding allocations to the normal editor hot path.
+    """
+    known = set(known_paths or set())
+    normalized_known = {
+        os.path.normcase(str(_resolved_path(_uri_to_path(entry))))
+        for entry in known
+    }
+    resolved = resolve_include_path(
+        directive_filename,
+        including_file_uri_or_path,
+        search_paths,
+        known_paths=known,
+    )
+    attempts: List[Dict[str, Any]] = []
+
+    def _known_match(candidate: Path) -> bool:
+        return os.path.normcase(str(_resolved_path(candidate))) in normalized_known
+
+    def _add(kind: str, candidate: Path, *, detail: Optional[str] = None) -> None:
+        resolved_candidate = _resolved_path(candidate)
+        attempts.append(
+            {
+                "kind": kind,
+                "path": str(resolved_candidate),
+                "on_disk": candidate.is_file(),
+                "known_virtual": _known_match(candidate),
+                "selected": bool(
+                    resolved is not None and _paths_equal(resolved_candidate, resolved)
+                ),
+                **({"detail": detail} if detail else {}),
+            }
+        )
+
+    if not directive_filename:
+        return {
+            "resolved": False,
+            "resolved_path": None,
+            "resolution_kind": None,
+            "attempts": attempts,
+        }
+
+    candidate_rel = Path(_normalize_separators(directive_filename))
+    if candidate_rel.is_absolute():
+        _add("absolute", candidate_rel)
+    else:
+        including_path = _uri_to_path(including_file_uri_or_path)
+        including_dir = (
+            including_path.parent
+            if including_path.is_file() or including_path.suffix
+            else including_path
+        )
+        _add("sibling", including_dir / candidate_rel)
+        for index, search_path in enumerate(search_paths or []):
+            _add(
+                "search_path",
+                search_path / candidate_rel,
+                detail=f"search_paths[{index}]",
+            )
+        _add("virtual_relative", candidate_rel)
+
+        target_parts = candidate_rel.parts
+        suffix_matches: List[Path] = []
+        seen: set[str] = set()
+        for entry in known:
+            known_path = _uri_to_path(entry)
+            if known_path.is_file():
+                continue
+            parts = known_path.parts
+            if len(parts) < len(target_parts):
+                continue
+            left = parts[-len(target_parts) :]
+            if os.name == "nt":
+                equal = tuple(part.casefold() for part in left) == tuple(
+                    part.casefold() for part in target_parts
+                )
+            else:
+                equal = left == target_parts
+            if not equal:
+                continue
+            candidate = _resolved_path(known_path)
+            key = os.path.normcase(str(candidate))
+            if key not in seen:
+                suffix_matches.append(candidate)
+                seen.add(key)
+        for candidate in suffix_matches:
+            _add(
+                "virtual_suffix",
+                candidate,
+                detail=(
+                    "unique suffix match"
+                    if len(suffix_matches) == 1
+                    else f"ambiguous: {len(suffix_matches)} suffix matches"
+                ),
+            )
+
+    selected_index = next(
+        (index for index, attempt in enumerate(attempts) if attempt["selected"]),
+        None,
+    )
+    for index, attempt in enumerate(attempts):
+        attempt["selected"] = index == selected_index
+    selected = attempts[selected_index] if selected_index is not None else None
+    return {
+        "resolved": resolved is not None,
+        "resolved_path": str(resolved) if resolved is not None else None,
+        "resolution_kind": selected["kind"] if selected is not None else None,
+        "attempts": attempts,
+    }
 
 
 def find_workspace_root(start_path: Path) -> Path:

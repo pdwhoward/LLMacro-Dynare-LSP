@@ -30,7 +30,7 @@ Then restart Claude Code so the language server attaches.
 
 ## Troubleshooting
 
-- Run `python -c "import dynare_lsp, dynare_lsp.mcp_server"` in the same shell
+- Run `python -c "import dynare_lsp, dynare_lsp.mcp_preflight_server"` in the same shell
   that launches Claude Code.
 - Confirm the plugin is enabled with `/plugin` and restart Claude Code after
   installing or updating it.

@@ -15,14 +15,24 @@ Codes:
   W093  estimated_params references an undeclared symbol
   W094  estimated_params bound/initial-value inconsistency
   W095  observation_trends variable not listed in varobs
+  W096  estimated-parameter value/prior outside mathematical support
+  W097  invalid prior hyperparameters (mean/standard deviation)
 """
 
 from __future__ import annotations
 
+import math
 from typing import List, Optional, Set
 
 from .diagnostics import Diagnostic, Severity
-from .parser import ParsedModel, Position, SourceRange
+from .parser import (
+    _PRIOR_SHAPES,
+    _strip_comments,
+    EstimatedParam,
+    ParsedModel,
+    Position,
+    SourceRange,
+)
 
 _FALLBACK_RANGE = SourceRange(Position(0, 0), Position(0, 1))
 
@@ -30,6 +40,222 @@ _FALLBACK_RANGE = SourceRange(Position(0, 0), Position(0, 1))
 def _rng(rng: Optional[SourceRange]) -> SourceRange:
     return rng if rng is not None else _FALLBACK_RANGE
 
+
+def _format_bounds(lower: Optional[float], upper: Optional[float]) -> str:
+    """Render inclusive estimated-parameter bounds, including one-sided ones."""
+    if lower is None or (math.isinf(lower) and lower < 0):
+        left = "(-inf"
+    else:
+        left = f"[{lower:g}"
+    if upper is None or (math.isinf(upper) and upper > 0):
+        right = "+inf)"
+    else:
+        right = f"{upper:g}]"
+    return f"{left}, {right}"
+
+
+def _source_slice(text: str, rng: Optional[SourceRange]) -> str:
+    """Return the source text covered by a position range."""
+    if rng is None:
+        return ""
+    lines = text.splitlines(keepends=True)
+    if not lines or rng.start.line >= len(lines):
+        return ""
+    last_line = min(rng.end.line, len(lines) - 1)
+    if rng.start.line == last_line:
+        return lines[rng.start.line][rng.start.character : rng.end.character]
+    pieces = [lines[rng.start.line][rng.start.character :]]
+    pieces.extend(lines[rng.start.line + 1 : last_line])
+    pieces.append(lines[last_line][: rng.end.character])
+    return "".join(pieces)
+
+
+def _parse_explicit_bound(token: str) -> Optional[float]:
+    """Parse a literal bound while treating an empty field as unspecified."""
+    token = token.strip()
+    if not token:
+        return None
+    try:
+        value = float(token)
+    except ValueError:
+        return None
+    return None if math.isnan(value) else value
+
+
+def _explicit_source_bounds(
+    model: ParsedModel,
+    entry: EstimatedParam,
+) -> tuple[Optional[float], Optional[float]]:
+    """Recover explicit bounds that the parser drops when one field is empty.
+
+    Dynare permits empty numeric fields in ``estimated_params``.  The parser's
+    compact numeric-prefix representation intentionally stops at the first
+    empty field, so a source line with only a lower or only an upper bound can
+    leave both ``entry.lower`` and ``entry.upper`` unset.  The entry range still
+    preserves the original fields, which is sufficient for this diagnostic.
+    """
+    raw = _strip_comments(_source_slice(model.text, entry.range)).strip()
+    if raw.endswith(";"):
+        raw = raw[:-1]
+    fields = [field.strip() for field in raw.split(",")]
+    rest_start = 2 if entry.kind == "corr" else 1
+    shape_index = next(
+        (
+            index
+            for index in range(rest_start, len(fields))
+            if fields[index].lower() in _PRIOR_SHAPES
+        ),
+        len(fields),
+    )
+
+    def bound_at(index: int) -> Optional[float]:
+        if index >= len(fields) or index >= shape_index:
+            return None
+        return _parse_explicit_bound(fields[index])
+
+    return bound_at(rest_start + 1), bound_at(rest_start + 2)
+
+
+
+def _prior_fields(
+    model: ParsedModel,
+    entry: EstimatedParam,
+) -> tuple[str, Optional[float], Optional[float]]:
+    """Recover prior shape, mean, and standard deviation from source fields."""
+    raw = _strip_comments(_source_slice(model.text, entry.range)).strip()
+    if raw.endswith(";"):
+        raw = raw[:-1]
+    fields = [field.strip() for field in raw.split(",")]
+    rest_start = 2 if entry.kind == "corr" else 1
+    for index in range(rest_start, len(fields)):
+        shape = fields[index].lower()
+        if shape not in _PRIOR_SHAPES:
+            continue
+        def value_at(offset: int) -> Optional[float]:
+            j = index + offset
+            if j >= len(fields) or not fields[j]:
+                return None
+            try:
+                value = float(fields[j])
+            except ValueError:
+                return None
+            return value
+        return shape, value_at(1), value_at(2)
+    return entry.prior_shape, None, None
+
+
+def _prior_support_diagnostics(
+    model: ParsedModel,
+    entry: EstimatedParam,
+    lower: Optional[float],
+    upper: Optional[float],
+) -> List[Diagnostic]:
+    """W096/W097 -- objective support and hyperparameter validity checks."""
+    rng = _rng(entry.range)
+    shape, prior_mean, prior_std = _prior_fields(model, entry)
+    diagnostics: List[Diagnostic] = []
+
+    if prior_std is not None and (not math.isfinite(prior_std) or prior_std <= 0):
+        diagnostics.append(Diagnostic(
+            range=rng,
+            severity=Severity.WARNING,
+            message=(
+                f"estimated_params: '{entry.name}' prior standard deviation "
+                f"must be finite and positive; got {prior_std:g}."
+            ),
+            source="dynare",
+            code="W097",
+        ))
+
+    if prior_mean is not None and not math.isfinite(prior_mean):
+        diagnostics.append(Diagnostic(
+            range=rng,
+            severity=Severity.WARNING,
+            message=(
+                f"estimated_params: '{entry.name}' prior mean must be finite; "
+                f"got {prior_mean:g}."
+            ),
+            source="dynare",
+            code="W097",
+        ))
+        prior_mean = None
+
+    positive_support = entry.kind == "stderr" or shape in {
+        "gamma_pdf", "inv_gamma_pdf", "inv_gamma1_pdf", "inv_gamma2_pdf", "weibull_pdf"
+    }
+    if positive_support:
+        candidates = [
+            ("initial value", entry.init),
+            ("lower bound", lower),
+            ("prior mean", prior_mean),
+        ]
+        for label, value in candidates:
+            if value is not None and math.isfinite(value) and value < 0:
+                diagnostics.append(Diagnostic(
+                    range=rng,
+                    severity=Severity.WARNING,
+                    message=(
+                        f"estimated_params: '{entry.name}' {label} {value:g} "
+                        "is outside the non-negative support required by this "
+                        "standard-deviation/positive prior specification."
+                    ),
+                    source="dynare",
+                    code="W096",
+                ))
+                break
+
+    if entry.kind == "corr":
+        candidates = [
+            ("initial value", entry.init),
+            ("lower bound", lower),
+            ("upper bound", upper),
+            ("prior mean", prior_mean),
+        ]
+        for label, value in candidates:
+            if value is not None and math.isfinite(value) and not -1 <= value <= 1:
+                diagnostics.append(Diagnostic(
+                    range=rng,
+                    severity=Severity.WARNING,
+                    message=(
+                        f"estimated_params: correlation '{entry.name}, "
+                        f"{entry.corr_with}' {label} {value:g} lies outside "
+                        "the mathematical correlation support [-1, 1]."
+                    ),
+                    source="dynare",
+                    code="W096",
+                ))
+                break
+
+    if shape == "beta_pdf" and prior_mean is not None:
+        if not 0 < prior_mean < 1:
+            diagnostics.append(Diagnostic(
+                range=rng,
+                severity=Severity.WARNING,
+                message=(
+                    f"estimated_params: beta prior for '{entry.name}' has mean "
+                    f"{prior_mean:g}, outside its open support (0, 1)."
+                ),
+                source="dynare",
+                code="W096",
+            ))
+        elif prior_std is not None and math.isfinite(prior_std) and prior_std > 0:
+            max_variance = prior_mean * (1.0 - prior_mean)
+            if prior_std * prior_std >= max_variance:
+                diagnostics.append(Diagnostic(
+                    range=rng,
+                    severity=Severity.WARNING,
+                    message=(
+                        f"estimated_params: beta prior for '{entry.name}' has "
+                        f"mean {prior_mean:g} and standard deviation "
+                        f"{prior_std:g}; these imply non-positive beta shape "
+                        "parameters because variance must be below "
+                        "mean*(1-mean)."
+                    ),
+                    source="dynare",
+                    code="W097",
+                ))
+
+    return diagnostics
 
 def check_estimation(
     model: ParsedModel,
@@ -157,33 +383,35 @@ def check_estimation(
                         code="W093",
                     ))
 
-        if entry.lower is not None and entry.upper is not None and entry.lower >= entry.upper:
+        source_lower, source_upper = _explicit_source_bounds(model, entry)
+        lower = entry.lower if entry.lower is not None else source_lower
+        upper = entry.upper if entry.upper is not None else source_upper
+        if lower is not None and upper is not None and lower >= upper:
             diagnostics.append(Diagnostic(
                 range=rng,
                 severity=Severity.WARNING,
                 message=(
-                    f"estimated_params: '{entry.name}' has lower bound {entry.lower:g} "
-                    f">= upper bound {entry.upper:g}."
+                    f"estimated_params: '{entry.name}' has lower bound {lower:g} "
+                    f">= upper bound {upper:g}."
                 ),
                 source="dynare",
                 code="W094",
             ))
-        if (
-            entry.init is not None
-            and entry.lower is not None
-            and entry.upper is not None
-            and not (entry.lower <= entry.init <= entry.upper)
-        ):
-            diagnostics.append(Diagnostic(
-                range=rng,
-                severity=Severity.WARNING,
-                message=(
-                    f"estimated_params: '{entry.name}' initial value {entry.init:g} is "
-                    f"outside its bounds [{entry.lower:g}, {entry.upper:g}]."
-                ),
-                source="dynare",
-                code="W094",
-            ))
+        if entry.init is not None:
+            below_lower = lower is not None and entry.init < lower
+            above_upper = upper is not None and entry.init > upper
+            if below_lower or above_upper:
+                diagnostics.append(Diagnostic(
+                    range=rng,
+                    severity=Severity.WARNING,
+                    message=(
+                        f"estimated_params: '{entry.name}' initial value {entry.init:g} "
+                        f"is outside its bounds {_format_bounds(lower, upper)}."
+                    ),
+                    source="dynare",
+                    code="W094",
+                ))
+        diagnostics.extend(_prior_support_diagnostics(model, entry, lower, upper))
 
     # --- observation_trends variables must be observed ---
     varobs_set = set(model.varobs_vars)

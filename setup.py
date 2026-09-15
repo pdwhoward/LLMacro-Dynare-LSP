@@ -33,13 +33,13 @@ setup(
             "sympy>=1.12",
         ],
         "mcp": [
-            "mcp>=0.1.0",
+            "mcp>=1.26.0,<2",
         ],
         "all": [
             "numpy>=1.20.0",
             "scipy>=1.7.0",
             "sympy>=1.12",
-            "mcp>=0.1.0",
+            "mcp>=1.26.0,<2",
         ],
         "dev": [
             "pytest>=7.0",
@@ -52,7 +52,7 @@ setup(
     entry_points={
         "console_scripts": [
             "dynare-lsp=dynare_lsp.__main__:main",
-            "dynare-mcp=dynare_lsp.mcp_server:main",
+            "dynare-mcp=dynare_lsp.mcp_preflight_server:main",
         ],
     },
     package_data={

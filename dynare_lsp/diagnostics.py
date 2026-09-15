@@ -11,6 +11,7 @@ Generates LSP-compatible diagnostics from a parsed model, covering:
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass, replace
 from enum import IntEnum
 from typing import Dict, List, Optional, Tuple
@@ -27,6 +28,7 @@ from .parser import (
     _block_ranges,
     _find_all_blocks,
     _inside_block,
+    _inside_quoted_string,
     _iter_equation_tag_spans,
     _macro_branch_state,
     _macro_truth_value,
@@ -37,6 +39,7 @@ from .parser import (
     _unresolved_macro_for_template_ranges,
     parse,
 )
+from .performance import record_work
 from .steady_state import evaluate_steady_state_model_assignments, validate_steady_state
 
 
@@ -390,7 +393,8 @@ def model_with_include_context(
             # iteration); everything else stays a singleton so textually
             # nested includes still interleave per-item like before.
             keys = [_key(item) for item in items]
-            duplicated = {key for key in keys if keys.count(key) > 1}
+            frequencies = Counter(keys)
+            duplicated = {key for key, count in frequencies.items() if count > 1}
             runs, current = [], []
             prev_key = None
             for item, key in zip(items, keys):
@@ -1081,18 +1085,6 @@ def _extract_equation_references(
 _STRING_LITERAL_RE = re.compile(r"\"[^\"\n]*\"|'[^'\n]*'")
 _MCP_TAG_VALUE_RE = re.compile(r"\bmcp\s*=\s*(['\"])(.*?)\1", re.IGNORECASE)
 _TAG_ATTRIBUTE_KEY_RE = re.compile(r"\b(?:name|mcp)\b(?=\s*=)", re.IGNORECASE)
-
-
-def _inside_quoted_string(text: str, offset: int) -> bool:
-    quote: Optional[str] = None
-    for ch in text[:offset]:
-        if quote is not None:
-            if ch == quote:
-                quote = None
-            continue
-        if ch in ('"', "'"):
-            quote = ch
-    return quote is not None
 
 
 def _mask_strings_preserving_mcp_values(text: str) -> str:
@@ -1938,6 +1930,15 @@ def _check_undeclared_references(
         if (name := _model_local_name(equation)) is not None
     }
     seen_undeclared: set = set()  # avoid duplicate reports for same identifier
+    declared = set(always_visible_includes) | set(on_the_fly_names)
+    ordered_declarations = sorted(
+        declarations,
+        key=lambda declaration: (
+            declaration.range.start.line,
+            declaration.range.start.character,
+        ),
+    )
+    declaration_index = 0
 
     for eq in sorted(
         model.model_equations,
@@ -1949,16 +1950,16 @@ def _check_undeclared_references(
         ),
     ):
         equation_position = (eq.range.start.line, eq.range.start.character)
-        declared = set(always_visible_includes) | set(on_the_fly_names)
-        declared.update(
-            declaration.name
-            for declaration in declarations
-            if (
+        while declaration_index < len(ordered_declarations):
+            declaration = ordered_declarations[declaration_index]
+            declaration_position = (
                 declaration.range.start.line,
                 declaration.range.start.character,
             )
-            <= equation_position
-        )
+            if declaration_position > equation_position:
+                break
+            declared.add(declaration.name)
+            declaration_index += 1
         refs = _extract_equation_references(eq, declared)
         local_name = _model_local_name(eq)
         if local_name is not None:
@@ -4732,6 +4733,9 @@ def run_diagnostics(
     range.  All optional arguments default to ``None`` so the historical
     single-file signature stays backwards-compatible.
     """
+    record_work("diagnostics.runs")
+    record_work("diagnostics.characters", len(model.text))
+    record_work("diagnostics.equations", len(model.model_equations))
     diagnostics: List[Diagnostic] = []
     has_unresolved_includes = bool(unresolved_includes)
     context_model = model_with_include_context(

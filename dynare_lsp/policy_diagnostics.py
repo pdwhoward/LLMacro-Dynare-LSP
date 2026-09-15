@@ -4,14 +4,15 @@ Mirrors the setup requirements Dynare enforces for optimal policy
 (``ComputingTasks.cc`` / ``ramsey_*``, ``discretionary_policy``, ``osr``): a
 Ramsey or discretionary problem needs a ``planner_objective``; instruments must
 be endogenous; the planner discount factor must be a valid discount factor; and
-``osr`` needs both the parameters to optimise (``osr_params``) and an objective
-(``optim_weights``).  All findings are warnings.
+``osr`` needs both the parameters to optimise (``osr_params``) and exactly one
+objective form (``optim_weights`` or ``planner_objective``). All findings are
+warnings.
 
 Codes:
   W100  optimal-policy command requires a planner_objective
   W101  policy instrument is not a declared endogenous variable
   W102  planner_discount is not a valid discount factor in (0, 1]
-  W103  osr is missing osr_params or optim_weights
+  W103  osr has invalid parameter or objective setup
 """
 
 from __future__ import annotations
@@ -82,7 +83,7 @@ def check_policy(model: ParsedModel, endogenous: Set[str]) -> List[Diagnostic]:
             code="W102",
         ))
 
-    # W103 -- osr needs osr_params and an optim_weights objective.
+    # W103 -- osr needs osr_params and exactly one objective form.
     if "osr" in model.policy_commands:
         if not model.osr_params:
             diagnostics.append(Diagnostic(
@@ -95,13 +96,25 @@ def check_policy(model: ParsedModel, endogenous: Set[str]) -> List[Diagnostic]:
                 source="dynare",
                 code="W103",
             ))
-        if not model.has_optim_weights:
+        has_planner_objective = model.planner_objective_range is not None
+        if not model.has_optim_weights and not has_planner_objective:
             diagnostics.append(Diagnostic(
                 range=anchor,
                 severity=Severity.WARNING,
                 message=(
-                    "osr requires an optim_weights block defining the "
-                    "objective (the weights on the target variables)."
+                    "osr requires exactly one objective form: an optim_weights "
+                    "block or a planner_objective statement."
+                ),
+                source="dynare",
+                code="W103",
+            ))
+        elif model.has_optim_weights and has_planner_objective:
+            diagnostics.append(Diagnostic(
+                range=anchor,
+                severity=Severity.WARNING,
+                message=(
+                    "osr accepts only one objective form; optim_weights and "
+                    "planner_objective cannot both be present."
                 ),
                 source="dynare",
                 code="W103",

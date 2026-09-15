@@ -49,6 +49,7 @@ from .parser import (
     parse,
     Position as DPos,
     SourceRange as DRange,
+    _inside_quoted_string,
     _iter_equation_tag_spans,
     _macro_branch_state,
     _mask_inactive_macro_lines,
@@ -4934,6 +4935,62 @@ def _show_message(message_type: "lsp.MessageType", message: str) -> None:
         )
 
 
+@server.command("dynare/traceIncludes")
+@server.thread()
+def trace_includes_command(*args):
+    """Explain macro-aware include resolution for the active document."""
+    uri = _uri_from_command_args(args)
+    if uri is None:
+        return {"success": False, "message": "Missing or invalid URI argument"}
+    text = _command_document_text(uri)
+    if text is None:
+        return {"success": False, "message": "Document not available"}
+    _workspace_index.update_document(uri, text)
+    try:
+        trace = _workspace_index.trace_includes(uri)
+    except Exception as exc:
+        logger.exception("Include trace failed for %s", uri)
+        return {"success": False, "message": f"Include trace failed: {exc}"}
+    counts = trace.get("counts", {})
+    _show_message(
+        lsp.MessageType.Info,
+        "Include trace: "
+        f"{trace.get('n_events', 0)} directive(s), "
+        f"{counts.get('resolved', 0)} resolved, "
+        f"{counts.get('unresolved', 0)} unresolved, "
+        f"{counts.get('cycle', 0)} cycle(s).",
+    )
+    return {"success": True, **trace}
+
+
+@server.command("dynare/profileAnalysis")
+@server.thread()
+def profile_analysis_command(*args):
+    """Return deterministic parser/workspace/diagnostic work counters."""
+    uri = _uri_from_command_args(args)
+    if uri is None:
+        return {"success": False, "message": "Missing or invalid URI argument"}
+    text = _command_document_text(uri)
+    if text is None:
+        return {"success": False, "message": "Document not available"}
+    files = _workspace_files_for_execution(uri, text)
+    active_file = _execution_file_key(uri)
+    try:
+        from .analysis_profile import profile_workspace_analysis
+
+        profile = profile_workspace_analysis(active_file, files)
+    except Exception as exc:
+        logger.exception("Analysis profile failed for %s", uri)
+        return {"success": False, "message": f"Analysis profile failed: {exc}"}
+    _show_message(
+        lsp.MessageType.Info,
+        "Analysis profile: "
+        f"{profile.get('total_operation_units', 0)} deterministic call unit(s) "
+        f"across {profile.get('n_files_included', 0) + 1} file(s).",
+    )
+    return {"success": True, **profile}
+
+
 @server.command("dynare/runPreprocessor")
 @server.thread()
 def run_preprocessor_command(*args):
@@ -5644,18 +5701,6 @@ def _is_on_the_fly_kind_marker(source_line: str, start: int, end: int) -> bool:
     )
 
 
-def _inside_quoted_string(text: str, offset: int) -> bool:
-    quote: Optional[str] = None
-    for ch in text[:offset]:
-        if quote is not None:
-            if ch == quote:
-                quote = None
-            continue
-        if ch in ('"', "'"):
-            quote = ch
-    return quote is not None
-
-
 def _mask_strings_preserving_mcp_values(source: str) -> str:
     """Mask strings except the expression part of equation ``mcp=`` tags."""
     keep = [False] * len(source)
@@ -5987,6 +6032,10 @@ def _build_model_local_rename_edit(
         return None
     if _reserved_identifier_reason(new_name) is not None:
         return None
+    if new_name != old_name and _find_symbol_occurrences_in_model_source(
+        source, new_name, model
+    ):
+        return None
     edits = [
         lsp.TextEdit(
             range=_to_lsp_range_in_text(source, rng),
@@ -6079,6 +6128,10 @@ def _build_model_local_context_rename_edit(
     if _reserved_identifier_reason(old_name) is not None:
         return None
     if _reserved_identifier_reason(new_name) is not None:
+        return None
+    if new_name != old_name and _collect_cross_file_references(
+        uri, source, new_name, workspace_index, open_document_sources
+    ):
         return None
     refs = _collect_model_local_references(
         uri,
@@ -6463,6 +6516,13 @@ def _build_rename_edit(
     if _reserved_identifier_reason(old_name) is not None:
         return None
     if _reserved_identifier_reason(new_name) is not None:
+        return None
+
+    # Existing uses would be captured even when their declaration is missing.
+    # Use the same include scope and non-code filtering as the rename itself.
+    if new_name != old_name and _collect_cross_file_references(
+        active_uri, active_source, new_name, workspace_index, open_document_sources
+    ):
         return None
 
     refs = _collect_cross_file_references(
@@ -7222,6 +7282,52 @@ def range_formatting(
                 end=lsp.Position(line=end_line, character=end_char),
             ),
             new_text=replacement,
+        )
+    ]
+
+
+@server.feature(
+    lsp.TEXT_DOCUMENT_ON_TYPE_FORMATTING,
+    lsp.DocumentOnTypeFormattingOptions(
+        first_trigger_character="\n",
+        more_trigger_character=[";"],
+    ),
+)
+def on_type_formatting(
+    params: lsp.DocumentOnTypeFormattingParams,
+) -> Optional[List[lsp.TextEdit]]:
+    """Indent the current line after Enter or a statement semicolon."""
+    from .formatter import format_on_type
+
+    uri = params.text_document.uri
+    doc = server.workspace.get_text_document(uri)
+    text = doc.source
+    lines = text.split("\n")
+    source_position = _lsp_position_to_source_position(lines, params.position)
+    result = format_on_type(
+        text,
+        source_position.line,
+        source_position.character,
+        params.ch,
+        _format_indent_unit,
+    )
+    if result is None:
+        return None
+    line, old_indent, new_indent = result
+    source_line = lines[line].rstrip("\r")
+    return [
+        lsp.TextEdit(
+            range=lsp.Range(
+                start=lsp.Position(line=line, character=0),
+                end=lsp.Position(
+                    line=line,
+                    character=_source_index_to_lsp_character(
+                        source_line,
+                        old_indent,
+                    ),
+                ),
+            ),
+            new_text=new_indent,
         )
     ]
 

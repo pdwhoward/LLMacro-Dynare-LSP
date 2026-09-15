@@ -708,16 +708,15 @@ _ENTRIES: Dict[str, Dict[str, str]] = {
         ),
     },
     "W103": {
-        "title": "osr is missing osr_params or optim_weights",
+        "title": "osr has invalid parameter or objective setup",
         "body": (
             "Optimal simple rules (``osr``) optimise the values of chosen "
-            "parameters to minimise a weighted objective, so they require an "
-            "``osr_params`` statement (the parameters to optimise) and an "
-            "``optim_weights`` block (the objective weights). One of these is "
-            "missing.\n\n"
+            "parameters to minimise an objective, so they require an "
+            "``osr_params`` statement and exactly one objective form: either "
+            "an ``optim_weights`` block or a ``planner_objective`` statement.\n\n"
             "**Fix**\n\n"
-            "Add the missing ``osr_params`` statement and/or ``optim_weights`` "
-            "block."
+            "Add the missing setup, or remove one objective form when both are "
+            "present."
         ),
     },
     "W110": {

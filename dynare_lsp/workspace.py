@@ -30,16 +30,16 @@ to dict access only — parsing and disk I/O run without the lock held.
 
 from __future__ import annotations
 
-import ast
 import logging
 import os
 import re
 import threading
 from dataclasses import replace
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from .include_resolver import _uri_to_path, resolve_include_path
+from .include_resolver import _uri_to_path, resolve_include_path, trace_include_path
+from .performance import record_work
 from .parser import (
     IncludeDirective,
     MacroDirective,
@@ -50,13 +50,12 @@ from .parser import (
     _extract_macro_defines,
     _mask_string_literals,
     _macro_branch_state,
+    _macro_truth_value as _parser_macro_truth_value,
     _parse_equations,
     _parse_includes,
     _parse_initval_block,
     _parse_macro_directives,
     _parse_macro_for_equations,
-    _safe_eval,
-    _simple_macro_list_values,
     _simple_macro_for_values,
     _strip_comments,
     _strip_non_macro_comments,
@@ -183,172 +182,38 @@ class WorkspaceIndex:
     @staticmethod
     def _macro_event_model(model: ParsedModel) -> ParsedModel:
         source = getattr(model, "original_text", "") or model.text
+        if getattr(model, "_workspace_macro_event_source", None) == source:
+            record_work("workspace.macro_event_cache_hits")
+            return model
+        cached = getattr(model, "_workspace_macro_event_cache", None)
+        if (
+            isinstance(cached, tuple)
+            and len(cached) == 2
+            and cached[0] == source
+            and isinstance(cached[1], ParsedModel)
+        ):
+            record_work("workspace.macro_event_cache_hits")
+            return cached[1]
+
+        record_work("workspace.macro_event_builds")
         masked = _strip_non_macro_comments(source)
-        return replace(
+        event_model = replace(
             model,
             text=source,
             original_text=source,
             includes=_parse_includes(masked),
             macro_directives=_parse_macro_directives(masked),
         )
+        setattr(model, "_workspace_macro_event_cache", (source, event_model))
+        setattr(event_model, "_workspace_macro_event_source", source)
+        return event_model
 
     @staticmethod
     def _macro_truth_value(
         argument: Optional[str], defines: Dict[str, str]
     ) -> Optional[bool]:
-        if argument is None:
-            return None
-        raw = argument.strip()
-        unknown = object()
-
-        def _scalar(expr: str, seen: Optional[set] = None) -> object:
-            seen = seen or set()
-            value = expr.strip()
-            list_values = _simple_macro_list_values(value)
-            if list_values is not None:
-                out: List[object] = []
-                for item in list_values:
-                    resolved = _scalar(item, seen)
-                    out.append(item if resolved is unknown else resolved)
-                return out
-            if value in defines and value not in seen:
-                resolved = _scalar(defines[value], seen | {value})
-                return defines[value].strip() if resolved is unknown else resolved
-            if (value.startswith('"') and value.endswith('"')) or (
-                value.startswith("'") and value.endswith("'")
-            ):
-                return value[1:-1].strip()
-            lowered = value.lower()
-            if lowered in {"", "0", "false", "no"}:
-                return False
-            if lowered in {"1", "true", "yes"}:
-                return True
-            try:
-                return float(value)
-            except ValueError:
-                evaluated = _safe_eval(value, {})
-                return unknown if evaluated is None else evaluated
-
-        def _truth(value: object) -> Optional[bool]:
-            if value is unknown:
-                return None
-            if isinstance(value, bool):
-                return value
-            if isinstance(value, (int, float)):
-                return value != 0
-            if isinstance(value, str):
-                return value.strip().lower() not in {"", "0", "false", "no"}
-            return None
-
-        direct = _scalar(raw)
-        if direct is not unknown:
-            return _truth(direct)
-
-        expression = raw.replace("&&", " and ").replace("||", " or ")
-        expression = re.sub(r"(?<![=!<>])!(?!=)", " not ", expression).strip()
-        try:
-            tree = ast.parse(expression, mode="eval")
-        except SyntaxError:
-            return None
-
-        def _eval(node: ast.AST) -> object:
-            if isinstance(node, ast.Expression):
-                return _eval(node.body)
-            if isinstance(node, ast.Constant):
-                if isinstance(node.value, (bool, int, float, str)):
-                    return node.value
-                return unknown
-            if isinstance(node, ast.Name):
-                return _scalar(node.id)
-            if isinstance(node, ast.List):
-                values = [_eval(elt) for elt in node.elts]
-                return unknown if any(value is unknown for value in values) else values
-            if isinstance(node, ast.Tuple):
-                values = [_eval(elt) for elt in node.elts]
-                return (
-                    unknown
-                    if any(value is unknown for value in values)
-                    else tuple(values)
-                )
-            if isinstance(node, ast.UnaryOp):
-                operand = _eval(node.operand)
-                if operand is unknown:
-                    return unknown
-                if isinstance(node.op, ast.Not):
-                    truth = _truth(operand)
-                    return unknown if truth is None else not truth
-                if isinstance(operand, (int, float)):
-                    if isinstance(node.op, ast.USub):
-                        return -operand
-                    if isinstance(node.op, ast.UAdd):
-                        return operand
-                return unknown
-            if isinstance(node, ast.BoolOp):
-                values = [_truth(_eval(v)) for v in node.values]
-                if any(v is None for v in values):
-                    return unknown
-                if isinstance(node.op, ast.And):
-                    return all(values)
-                if isinstance(node.op, ast.Or):
-                    return any(values)
-                return unknown
-            if isinstance(node, ast.BinOp):
-                left = _eval(node.left)
-                right = _eval(node.right)
-                if not isinstance(left, (int, float)) or not isinstance(
-                    right, (int, float)
-                ):
-                    return unknown
-                if isinstance(node.op, ast.Add):
-                    return left + right
-                if isinstance(node.op, ast.Sub):
-                    return left - right
-                if isinstance(node.op, ast.Mult):
-                    return left * right
-                if isinstance(node.op, ast.Div):
-                    return unknown if right == 0 else left / right
-                if isinstance(node.op, ast.Mod):
-                    return unknown if right == 0 else left % right
-                return unknown
-            if isinstance(node, ast.Compare):
-                left = _eval(node.left)
-                if left is unknown:
-                    return unknown
-                for op, comparator in zip(node.ops, node.comparators):
-                    right = _eval(comparator)
-                    if right is unknown:
-                        return unknown
-                    if isinstance(op, ast.In):
-                        try:
-                            ok = left in right  # type: ignore[operator]
-                        except TypeError:
-                            return unknown
-                    elif isinstance(op, ast.NotIn):
-                        try:
-                            ok = left not in right  # type: ignore[operator]
-                        except TypeError:
-                            return unknown
-                    elif isinstance(op, ast.Eq):
-                        ok = left == right
-                    elif isinstance(op, ast.NotEq):
-                        ok = left != right
-                    elif isinstance(op, ast.Lt):
-                        ok = left < right  # type: ignore[operator]
-                    elif isinstance(op, ast.LtE):
-                        ok = left <= right  # type: ignore[operator]
-                    elif isinstance(op, ast.Gt):
-                        ok = left > right  # type: ignore[operator]
-                    elif isinstance(op, ast.GtE):
-                        ok = left >= right  # type: ignore[operator]
-                    else:
-                        return unknown
-                    if not ok:
-                        return False
-                    left = right
-                return True
-            return unknown
-
-        return _truth(_eval(tree))
+        """Evaluate a macro condition with the parser's canonical semantics."""
+        return _parser_macro_truth_value(argument, defines)
 
     @staticmethod
     def _defines_for_macro_event(
@@ -833,6 +698,7 @@ class WorkspaceIndex:
 
     def _macro_events(self, model: ParsedModel) -> List[Tuple[int, int, str, object]]:
         """Return define/includepath/include events in source order."""
+        record_work("workspace.macro_event_walks")
         model = self._macro_event_model(model)
         raw_events: List[Tuple[int, int, str, object]] = []
         for directive in model.macro_directives:
@@ -855,6 +721,7 @@ class WorkspaceIndex:
                 )
             )
         raw_events.sort(key=lambda item: (item[0], item[1]))
+        record_work("workspace.macro_events", len(raw_events))
 
         def _emit_event(
             line: int,
@@ -1161,6 +1028,7 @@ class WorkspaceIndex:
         include doesn't contribute symbols" rather than propagating the
         error, since the missing file might just be transient.
         """
+        record_work("workspace.disk_reads")
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
@@ -1822,6 +1690,28 @@ class WorkspaceIndex:
             True,
         )
 
+    def _directive_resolution_inputs(
+        self,
+        including_key: str,
+        active_search_paths: Optional[List[Path]] = None,
+    ) -> Tuple[List[Path], _WorkspacePathKeys]:
+        """Snapshot the root-local paths and virtual files visible to an include."""
+        with self._lock:
+            search_paths = self._configured_search_paths_for_key_unlocked(
+                including_key,
+            )
+            model_keys = list(self._models.keys())
+            disk_loaded_keys = set(self._file_signatures.keys())
+        known_paths = _WorkspacePathKeys(
+            key
+            for key in model_keys
+            if key not in disk_loaded_keys or Path(key).is_file()
+        )
+        return (
+            self._append_unique(search_paths, active_search_paths or []),
+            known_paths,
+        )
+
     def _resolve_directive(
         self,
         including_key: str,
@@ -1835,24 +1725,228 @@ class WorkspaceIndex:
         documents are intentionally excluded so they cannot hide unresolved
         include diagnostics in another model.
         """
-        with self._lock:
-            search_paths = self._configured_search_paths_for_key_unlocked(
-                including_key,
-            )
-            model_keys = list(self._models.keys())
-            disk_loaded_keys = set(self._file_signatures.keys())
-        known_paths = _WorkspacePathKeys(
-            key
-            for key in model_keys
-            if key not in disk_loaded_keys or Path(key).is_file()
+        search_paths, known_paths = self._directive_resolution_inputs(
+            including_key,
+            active_search_paths,
         )
-        search_paths = self._append_unique(search_paths, active_search_paths or [])
         return resolve_include_path(
             filename,
             including_key,
             search_paths,
             known_paths=known_paths,
         )
+
+    def trace_includes(self, uri: str) -> Dict[str, Any]:
+        """Return an ordered explanation of macro-aware include resolution.
+
+        This is an explicit debugging surface, not part of the diagnostics hot
+        path.  Each include records the macro values and ``@#includepath``
+        directories visible at its source location, every candidate searched,
+        transitive depth, uncertainty, and cycle/unresolved status.
+        """
+        record_work("workspace.include_trace_calls")
+        root_key = _normalize_uri(uri)
+        events: List[Dict[str, Any]] = []
+        stack: List[str] = [root_key]
+
+        def _source_line(model: ParsedModel, line: int) -> str:
+            source = getattr(model, "original_text", "") or model.text
+            lines = source.splitlines()
+            return lines[line].strip() if 0 <= line < len(lines) else ""
+
+        def _visit(
+            current_key: str,
+            active_search_paths: List[Path],
+            inherited_defines: Optional[Dict[str, str]],
+            depth: int,
+        ) -> Tuple[List[Path], Dict[str, str]]:
+            current_model, _current_source = self._load_include_walk_model(
+                current_key,
+                inherited_defines,
+            )
+            if current_model is None:
+                return [], {}
+
+            side_paths: List[Path] = []
+            side_defines: Dict[str, str] = {}
+            scoped_define_ends: Dict[str, int] = {}
+            scoped_path_ends: Dict[Path, int] = {}
+            for line, character, kind, directive in self._macro_events(current_model):
+                self._drop_expired_macro_side_effects(
+                    line,
+                    side_defines,
+                    scoped_define_ends,
+                    side_paths,
+                    scoped_path_ends,
+                )
+                effective_paths = self._append_unique(active_search_paths, side_paths)
+                effective_defines = dict(inherited_defines or {})
+                effective_defines.update(side_defines)
+                active_defines = self._defines_for_macro_event(
+                    effective_defines,
+                    directive,
+                )
+                active = self._line_active(current_model, line, active_defines)
+                uncertain = self._line_has_uncertain_macro_context(
+                    current_model,
+                    line,
+                    active_defines,
+                )
+
+                if kind == "define":
+                    if not active or not isinstance(directive, MacroDirective):
+                        continue
+                    if not directive.argument:
+                        continue
+                    new_defines = _extract_macro_defines(
+                        f"@#define {directive.argument}\n",
+                        allow_complex=True,
+                    )
+                    new_defines = {
+                        name: _substitute_macro_arg(value, effective_defines)
+                        for name, value in new_defines.items()
+                    }
+                    side_defines.update(new_defines)
+                    if uncertain:
+                        end_line = self._macro_side_effect_scope_end(
+                            current_model,
+                            line,
+                        )
+                        for name in new_defines:
+                            scoped_define_ends[name] = end_line
+                    continue
+
+                if kind == "includepath":
+                    if not active or not isinstance(directive, MacroDirective):
+                        continue
+                    original_argument = directive.argument
+                    if original_argument is not None:
+                        directive = replace(
+                            directive,
+                            argument=_substitute_macro_arg(
+                                original_argument,
+                                effective_defines,
+                            ),
+                        )
+                    new_paths = self._includepath_paths(current_key, directive)
+                    added_paths = [path for path in new_paths if path not in side_paths]
+                    side_paths = self._append_unique(side_paths, new_paths)
+                    if uncertain:
+                        end_line = self._macro_side_effect_scope_end(
+                            current_model,
+                            line,
+                        )
+                        for path in added_paths:
+                            scoped_path_ends[path] = end_line
+                    continue
+
+                if not isinstance(directive, IncludeDirective):
+                    continue
+
+                include_variants = (
+                    self._include_define_variants(
+                        current_model,
+                        line,
+                        effective_defines,
+                        directive,
+                    )
+                    if active
+                    else [active_defines]
+                )
+                for include_defines in include_variants or [active_defines]:
+                    expanded_filename = _substitute_macro_arg(
+                        directive.filename,
+                        include_defines,
+                    )
+                    search_paths, known_paths = self._directive_resolution_inputs(
+                        current_key,
+                        effective_paths,
+                    )
+                    resolution = trace_include_path(
+                        expanded_filename,
+                        current_key,
+                        search_paths,
+                        known_paths=known_paths,
+                    )
+                    resolved_path = resolution.get("resolved_path")
+                    resolved_key = (
+                        _path_key(Path(str(resolved_path)))
+                        if isinstance(resolved_path, str) and resolved_path
+                        else None
+                    )
+                    status = "inactive"
+                    if active:
+                        if resolved_key is None:
+                            status = "unresolved"
+                        elif resolved_key in stack:
+                            status = "cycle"
+                        else:
+                            status = "resolved"
+                    context = self._directive_context(current_model, directive)
+                    event: Dict[str, Any] = {
+                        "sequence": len(events) + 1,
+                        "depth": depth,
+                        "including_file": current_key,
+                        "line": line + 1,
+                        "column": character + 1,
+                        "directive": _source_line(current_model, line),
+                        "filename": directive.filename,
+                        "expanded_filename": expanded_filename,
+                        "status": status,
+                        "active": active,
+                        "uncertain": uncertain,
+                        "context": context,
+                        "visible_defines": dict(sorted(include_defines.items())),
+                        "search_paths": [str(path) for path in search_paths],
+                        "chain": list(stack),
+                        **resolution,
+                    }
+                    events.append(event)
+                    if status != "resolved" or resolved_key is None:
+                        continue
+
+                    include_was_uncertain = uncertain
+                    stack.append(resolved_key)
+                    nested_paths, nested_defines = _visit(
+                        resolved_key,
+                        effective_paths,
+                        include_defines,
+                        depth + 1,
+                    )
+                    stack.pop()
+                    added_nested_paths = [
+                        path for path in nested_paths if path not in side_paths
+                    ]
+                    side_paths = self._append_unique(side_paths, nested_paths)
+                    side_defines.update(nested_defines)
+                    if include_was_uncertain:
+                        end_line = self._macro_side_effect_scope_end(
+                            current_model,
+                            line,
+                        )
+                        for path in added_nested_paths:
+                            scoped_path_ends[path] = end_line
+                        for name in nested_defines:
+                            scoped_define_ends[name] = end_line
+            return side_paths, side_defines
+
+        _visit(root_key, [], None, 0)
+        counts = {
+            status: sum(1 for event in events if event["status"] == status)
+            for status in ("resolved", "unresolved", "inactive", "cycle")
+        }
+        depths: List[int] = []
+        for event in events:
+            depth = event.get("depth")
+            if isinstance(depth, int):
+                depths.append(depth)
+        return {
+            "root": root_key,
+            "n_events": len(events),
+            "max_depth": max(depths, default=0),
+            "counts": counts,
+            "events": events,
+        }
 
     def resolve_all_includes(self, uri: str) -> Dict[str, ParsedModel]:
         """Return every transitively included file's :class:`ParsedModel`.
@@ -1863,6 +1957,7 @@ class WorkspaceIndex:
         result so callers can distinguish "this file" from "an included
         file".
         """
+        record_work("workspace.include_walks")
         root_key = _normalize_uri(uri)
         result: Dict[str, ParsedModel] = {}
         stack_keys: set = {root_key}
@@ -1927,6 +2022,7 @@ class WorkspaceIndex:
             inherited_context: Optional[str],
             inherited_defines: Optional[Dict[str, str]],
         ) -> Tuple[List[Path], Dict[str, str], ParsedModel]:
+            record_work("workspace.files_visited")
             current_model = _load_model(current_key, inherited_defines)
             if current_model is None:
                 return [], {}, parse("")

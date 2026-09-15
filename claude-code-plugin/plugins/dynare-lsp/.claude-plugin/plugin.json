@@ -19,7 +19,7 @@
   "mcpServers": {
     "dynare": {
       "command": "python",
-      "args": ["-m", "dynare_lsp.mcp_server"]
+      "args": ["-m", "dynare_lsp.mcp_preflight_server"]
     }
   }
 }

@@ -6,6 +6,7 @@ Mirrors checks the Dynare preprocessor performs on the *shape* of a model:
   W131  a variable assigned more than once in steady_state_model
   W140  a model declared ``linear`` uses a nonlinear operator on a variable
   W150  a deprecated command (``simul``, ``ramsey_policy``)
+  E066-E069 / W054-W055  histval/perfect-foresight initialization checks
 
 All findings are warnings.  W150 carries the LSP ``Deprecated`` tag so editors
 render the deprecated token struck through.  Each check is gated: a model that
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import re
+from dataclasses import replace
 from typing import List, Optional, Set, Tuple
 
 from .diagnostics import Diagnostic, Severity
@@ -23,6 +25,7 @@ from .parser import (
     ParsedModel,
     Position,
     SourceRange,
+    _find_all_blocks,
     _offset_to_position,
     _strip_comments,
 )
@@ -85,6 +88,7 @@ def check_model_form(
         )
     )
     diagnostics.extend(_check_deprecations(model))
+    diagnostics.extend(_check_histval(model))
     for include_model in include_models or []:
         diagnostics.extend(
             _check_deprecations(
@@ -93,6 +97,13 @@ def check_model_form(
                 include_policy_commands=False,
             )
         )
+        include_histval = _check_histval(include_model)
+        if include_model.include_anchor_range is not None:
+            include_histval = [
+                replace(item, range=include_model.include_anchor_range, fix=None)
+                for item in include_histval
+            ]
+        diagnostics.extend(include_histval)
     return diagnostics
 
 
@@ -191,6 +202,149 @@ def _check_steady_state_model(
 
 
 # ---------------------------------------------------------------------------
+# E066-E069 / W054-W055 -- histval and deterministic initialization
+# ---------------------------------------------------------------------------
+
+_HIST_ASSIGN_RE = re.compile(
+    r"(?m)^\s*([A-Za-z_]\w*)\s*(?:\(\s*([+-]?\d+)\s*\))?\s*=\s*([^;]+);"
+)
+
+
+def _check_histval(model: ParsedModel) -> List[Diagnostic]:
+    stripped = _strip_comments(model.text)
+    hist_blocks = _find_all_blocks(stripped, "histval")
+    if not hist_blocks:
+        return []
+
+    diagnostics: List[Diagnostic] = []
+    endval_blocks = _find_all_blocks(stripped, "endval")
+    first_hist = hist_blocks[0]
+    hist_anchor = SourceRange(
+        _offset_to_position(model.text, first_hist.start()),
+        _offset_to_position(model.text, first_hist.start() + len("histval")),
+    )
+
+    if endval_blocks:
+        diagnostics.append(Diagnostic(
+            range=hist_anchor,
+            severity=Severity.ERROR,
+            message=(
+                "A model cannot use both histval and endval for the same "
+                "deterministic simulation setup. Choose one initialization "
+                "scheme before running Dynare."
+            ),
+            source="dynare",
+            code="E066",
+        ))
+
+    after_hist = stripped[first_hist.end():]
+    steady_match = re.search(r"(?<!\w)steady(?!\w)\s*(?:\([^;]*\))?\s*;", after_hist, re.I)
+    if steady_match is not None:
+        start = first_hist.end() + steady_match.start()
+        diagnostics.append(Diagnostic(
+            range=SourceRange(
+                _offset_to_position(model.text, start),
+                _offset_to_position(model.text, start + len("steady")),
+            ),
+            severity=Severity.ERROR,
+            message=(
+                "A steady command after histval is incompatible with histval "
+                "initialization because steady would overwrite the historical "
+                "conditions used by the deterministic simulation."
+            ),
+            source="dynare",
+            code="E067",
+        ))
+
+    declared = model.endogenous_names() | model.exogenous_names() | model.deterministic_exogenous_names()
+    state_offsets: dict[str, set[int]] = {}
+    try:
+        from .bk_check import _extract_variable_timing
+        state_offsets = _extract_variable_timing(model)
+    except Exception:
+        pass
+    state_names = {
+        name for name, offsets in state_offsets.items() if any(offset < 0 for offset in offsets)
+    }
+
+    supplied: dict[str, set[int]] = {}
+    for block in hist_blocks:
+        body = block.group(2)
+        body_start = block.start(2)
+        for match in _HIST_ASSIGN_RE.finditer(body):
+            name = match.group(1)
+            offset = int(match.group(2) or "0")
+            start = body_start + match.start(1)
+            rng = SourceRange(
+                _offset_to_position(model.text, start),
+                _offset_to_position(model.text, start + len(name)),
+            )
+            if name not in declared:
+                diagnostics.append(Diagnostic(
+                    range=rng,
+                    severity=Severity.ERROR,
+                    message=f"histval assigns undeclared symbol '{name}'.",
+                    source="dynare",
+                    code="E068",
+                ))
+                continue
+            if offset > 0:
+                diagnostics.append(Diagnostic(
+                    range=rng,
+                    severity=Severity.ERROR,
+                    message=(
+                        f"histval entry '{name}({offset:+d})' is in a future "
+                        "period. Historical initialization accepts period 0 "
+                        "and negative lags, not positive leads."
+                    ),
+                    source="dynare",
+                    code="E069",
+                ))
+            supplied.setdefault(name, set()).add(offset)
+            if name in model.endogenous_names() and name not in state_names:
+                diagnostics.append(Diagnostic(
+                    range=rng,
+                    severity=Severity.WARNING,
+                    message=(
+                        f"histval specifies endogenous variable '{name}', but "
+                        "the dynamic model does not classify it as a state "
+                        "variable with a lag. Dynare uses histval to supply "
+                        "historical state values."
+                    ),
+                    source="dynare",
+                    code="W054",
+                ))
+
+    all_values_required = bool(re.search(
+        r"(?<!\w)histval\s*\(\s*all_values_required\s*\)", stripped, re.I
+    ))
+    for name in sorted(state_names):
+        required_lags = sorted(
+            offset for offset in state_offsets.get(name, set()) if offset < 0
+        )
+        missing = [offset for offset in required_lags if offset not in supplied.get(name, set())]
+        if not missing:
+            continue
+        rendered = ", ".join(f"{name}({offset})" for offset in missing)
+        severity = Severity.ERROR if all_values_required else Severity.WARNING
+        diagnostics.append(Diagnostic(
+            range=hist_anchor,
+            severity=severity,
+            message=(
+                f"histval does not provide required historical state value(s): "
+                f"{rendered}. " + (
+                    "all_values_required makes missing values an error."
+                    if all_values_required
+                    else "Dynare will initialize missing historical values to zero."
+                )
+            ),
+            source="dynare",
+            code="W055",
+        ))
+    return diagnostics
+
+
+# ---------------------------------------------------------------------------
 # W140 -- nonlinear operator in a model declared ``linear``
 # ---------------------------------------------------------------------------
 
@@ -232,8 +386,6 @@ def _mask_steady_state_calls(expr: str) -> str:
         if close_idx is None:
             break
         pieces.append(expr[cursor : match.start()])
-        # ``None`` parses as an AST constant but is not mistaken for a literal
-        # exponent of zero or one.
         pieces.append("None")
         cursor = close_idx + 1
     pieces.append(expr[cursor:])
@@ -251,11 +403,6 @@ def _check_linear_model(
     diagnostics: List[Diagnostic] = []
     seen: Set[Tuple[int, str]] = set()
     variable_aliases = set(variables)
-    # Scan all model equations, including model-local ``#`` definitions: a
-    # ``# z = abs(y);`` or ``# z = y*k;`` in a linear model is just as invalid,
-    # and Dynare rejects it (the preprocessor error is line-less, so the LSP
-    # would otherwise show nothing). ``dynamic_model_equations()`` excludes
-    # ``#`` defs, so iterate the full list here.
     for equation in model.model_equations:
         local_match = _LOCAL_VAR_DEF.match(equation.text.strip())
         if local_match:
@@ -303,8 +450,6 @@ def _linear_nonlinear_operator(expr: str, variables: Set[str]) -> Optional[str]:
         arg = _balanced_arg(analysis_expr, match.end() - 1)
         if arg is None:
             continue
-        # Applying the operator to a constant/parameter keeps the model
-        # linear; only flag when a variable is inside the call.
         if not any(tok in variables for tok in re.findall(r"[A-Za-z_]\w*", arg)):
             continue
         return match.group(1).lower()
@@ -390,9 +535,6 @@ def _check_deprecations(
 ) -> List[Diagnostic]:
     """W150 -- deprecated computation commands (``simul``, ``ramsey_policy``)."""
     diagnostics: List[Diagnostic] = []
-    # ``_strip_comments`` preserves string contents, so blank quoted strings
-    # too (length-preserving) before the keyword scan -- otherwise a
-    # ``long_name='...bytecode...'`` could be mistaken for the option.
     stripped = re.sub(
         r"'[^'\n]*'|\"[^\"\n]*\"",
         lambda m: " " * (m.end() - m.start()),
@@ -433,9 +575,6 @@ def _check_deprecations(
             )
         )
 
-    # Deprecated command options (aim_solver, bytecode).  Gated on the keyword
-    # not being a declared identifier or a model-local ``#`` definition so a
-    # same-named symbol is never flagged.
     declared = set(model.all_declared_names())
     for equation in model.model_equations:
         local = re.match(r"#\s*([A-Za-z][A-Za-z0-9_]*)\s*=", equation.text.strip())

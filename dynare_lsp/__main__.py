@@ -114,7 +114,9 @@ def main() -> None:
     )
 
     from .server import start_server
+    from .diagnostic_presentation import install as install_diagnostic_presentation
 
+    install_diagnostic_presentation()
     start_server(host=args.host, port=args.port, stdio=not args.tcp)
 
 
@@ -226,6 +228,7 @@ def _run_check(filepath: str, solve: bool = False) -> None:
 
 def _run_solve(text: str, filepath: str, model=None) -> None:
     """Compute the steady state and print results."""
+    from .diagnostics import _with_model_editing_commands
     from .parser import parse
 
     try:
@@ -239,6 +242,7 @@ def _run_solve(text: str, filepath: str, model=None) -> None:
 
     if model is None:
         model = parse(text)
+    model = _with_model_editing_commands(model)
     print(f"\nSolving steady state for {filepath}...")
     result = compute_steady_state(model)
 

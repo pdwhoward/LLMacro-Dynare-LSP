@@ -146,7 +146,7 @@ def _unit_root_note(model: ParsedModel, ss_values: dict) -> str:
     return ""
 
 
-def check_model_diagnostics(
+def _check_static_jacobian_diagnostics(
     model: ParsedModel,
     ss_values: dict,
     tol: float = 1e-8,
@@ -252,3 +252,21 @@ def check_model_diagnostics(
         ]
     except Exception:
         return []
+
+
+def check_model_diagnostics(
+    model: ParsedModel,
+    ss_values: dict,
+    tol: float = 1e-8,
+) -> List[Diagnostic]:
+    """Run Dynare-style static Jacobian and first-order innovation checks."""
+    diagnostics = _check_static_jacobian_diagnostics(model, ss_values, tol)
+    try:
+        from .stochastic_singularity import check_stochastic_singularity
+
+        diagnostics.extend(check_stochastic_singularity(model, ss_values))
+    except Exception:
+        # Optional numerical dependencies or an unsupported dynamic structure
+        # must never turn model_diagnostics itself into a hard failure.
+        pass
+    return diagnostics

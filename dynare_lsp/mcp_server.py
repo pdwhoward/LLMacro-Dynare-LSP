@@ -39,7 +39,7 @@ import sys
 from numbers import Real
 from typing import Any, Dict, List, Optional, Tuple
 
-from .parser import _iter_equation_tag_spans
+from .parser import _inside_quoted_string, _iter_equation_tag_spans
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -91,18 +91,6 @@ def _on_the_fly_marker_spans(text: str) -> List[Tuple[int, int]]:
             spans.append((offset + match.start(1), offset + match.end(1)))
         offset += len(line)
     return spans
-
-
-def _inside_quoted_string(text: str, offset: int) -> bool:
-    quote: Optional[str] = None
-    for ch in text[:offset]:
-        if quote is not None:
-            if ch == quote:
-                quote = None
-            continue
-        if ch in ('"', "'"):
-            quote = ch
-    return quote is not None
 
 
 def _mcp_value_ranges(text: str) -> List[Tuple[int, int]]:
@@ -1511,6 +1499,56 @@ def build_server():
         return out
 
     # -----------------------------------------------------------------------
+    # Workspace explainability and deterministic profiling
+    # -----------------------------------------------------------------------
+
+    @_tool()
+    def dynare_trace_includes(
+        active_file: str,
+        files: Dict[str, str],
+    ) -> Dict[str, Any]:
+        """Explain every macro-aware ``@#include`` resolution decision.
+
+        Returns the transitive include chain in source order.  Each event
+        reports active/uncertain macro state, visible ``@#define`` values,
+        effective search paths, every candidate attempted, the selected path,
+        and whether the directive resolved, was inactive, was unresolved, or
+        closed a cycle.
+        """
+        files = _rebase_relative_file_keys(active_file, files) or files
+        active_file = _resolve_active_file_key(
+            active_file,
+            files,
+            require_present=True,
+        )
+        index = WorkspaceIndex()
+        for filename, content in files.items():
+            index.update_document(filename, content)
+        return index.trace_includes(active_file)
+
+    @_tool()
+    def dynare_profile_analysis(
+        active_file: str,
+        files: Dict[str, str],
+    ) -> Dict[str, Any]:
+        """Profile native analysis with deterministic work-unit counters.
+
+        The report contains parser, workspace, include-resolution, and native
+        diagnostic operation counts.  It intentionally omits elapsed time, the
+        Dynare preprocessor, MATLAB, and numerical solving so results are stable
+        across machines and suitable for regression budgets.
+        """
+        from .analysis_profile import profile_workspace_analysis
+
+        files = _rebase_relative_file_keys(active_file, files) or files
+        active_file = _resolve_active_file_key(
+            active_file,
+            files,
+            require_present=True,
+        )
+        return profile_workspace_analysis(active_file, files)
+
+    # -----------------------------------------------------------------------
     # Model diff
     # -----------------------------------------------------------------------
 
@@ -1981,7 +2019,18 @@ def main() -> None:
     if not _MCP_AVAILABLE:
         print(_INSTALL_MESSAGE, file=sys.stderr)
         sys.exit(1)
-    server = build_server()
+    # ``python -m`` executes loader-provided code directly, bypassing the
+    # extension loader's normal ``exec_module`` installation path.
+    from types import SimpleNamespace
+
+    from .equation_dependencies import install_mcp
+
+    if globals().get("_equation_dependencies_installed", False):
+        server = build_server()
+    else:
+        entrypoint = SimpleNamespace(build_server=build_server)
+        install_mcp(entrypoint)
+        server = entrypoint.build_server()
     server.run()
 
 

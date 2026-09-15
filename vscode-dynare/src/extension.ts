@@ -6,6 +6,7 @@ import {
   LanguageClientOptions,
   ServerOptions,
 } from "vscode-languageclient/node";
+import { registerAnalysisReport } from "./analysisReport";
 
 let client: LanguageClient | undefined;
 let clientStartPromise: Promise<void> | undefined;
@@ -219,52 +220,163 @@ async function restartClient(context: ExtensionContext): Promise<boolean> {
   return true;
 }
 
-function registerMcpProvider(context: ExtensionContext): void {
-  // Register the bundled `dynare-mcp` server with VS Code's MCP support (agent
-  // mode in Chat) so installing this extension exposes BOTH the language server
-  // and the MCP analysis tools — one engine behind two transports. The MCP
-  // server-definition API arrived in VS Code 1.101; feature-detect it (and cast
-  // through `any`) so the extension still loads on older VS Code and compiles
-  // against @types/vscode that predate the API — the MCP server is just skipped.
-  const lm: any = (vscode as any).lm;
-  const Def: any = (vscode as any).McpStdioServerDefinition;
-  if (
-    !lm ||
-    typeof lm.registerMcpServerDefinitionProvider !== "function" ||
-    typeof Def !== "function"
-  ) {
-    return;
+function renderIncludeTrace(result: any): string {
+  if (!result || result.success === false) {
+    return `Include trace failed: ${result?.message ?? "unknown error"}`;
+  }
+  const counts = result.counts ?? {};
+  const lines: string[] = [
+    "Dynare macro/include resolution trace",
+    `Root: ${result.root ?? ""}`,
+    `Events: ${result.n_events ?? 0}; resolved ${counts.resolved ?? 0}; ` +
+      `unresolved ${counts.unresolved ?? 0}; inactive ${counts.inactive ?? 0}; ` +
+      `cycles ${counts.cycle ?? 0}`,
+    "",
+  ];
+  for (const event of result.events ?? []) {
+    const indent = "  ".repeat(Math.max(0, Number(event.depth ?? 0)));
+    lines.push(
+      `${event.sequence}. ${indent}` +
+        `[${String(event.status ?? "unknown").toUpperCase()}] ` +
+        `${event.including_file}:${event.line}:${event.column}`,
+      `${indent}   ${event.directive ?? `@#include ${event.filename ?? ""}`}`,
+      `${indent}   expanded: ${event.expanded_filename ?? event.filename ?? ""}`,
+      `${indent}   selected: ${event.resolved_path ?? "none"}` +
+        `${event.resolution_kind ? ` (${event.resolution_kind})` : ""}`,
+    );
+    const defines = Object.entries(event.visible_defines ?? {});
+    if (defines.length > 0) {
+      lines.push(
+        `${indent}   defines: ${defines
+          .map(([name, value]) => `${name}=${String(value)}`)
+          .join(", ")}`
+      );
+    }
+    for (const attempt of event.attempts ?? []) {
+      const marker = attempt.selected ? "*" : "-";
+      const state = attempt.on_disk
+        ? "disk"
+        : attempt.known_virtual
+        ? "virtual"
+        : "missing";
+      lines.push(
+        `${indent}   ${marker} ${attempt.kind}: ${attempt.path} [${state}]` +
+          `${attempt.detail ? ` — ${attempt.detail}` : ""}`
+      );
+    }
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+
+function renderAnalysisProfile(result: any): string {
+  if (!result || result.success === false) {
+    return `Analysis profile failed: ${result?.message ?? "unknown error"}`;
+  }
+  const lines: string[] = [
+    "Dynare deterministic analysis profile",
+    `Active file: ${result.active_file ?? ""}`,
+    `Supplied files: ${result.n_files_supplied ?? 0}; ` +
+      `included files: ${result.n_files_included ?? 0}`,
+    `Diagnostics: ${result.n_diagnostics ?? 0}; ` +
+      `total operation units: ${result.total_operation_units ?? 0}`,
+    `Scope: ${result.scope ?? ""}`,
+    "",
+    "Work units:",
+  ];
+  const units = Object.entries(result.work_units ?? {}).sort(([a], [b]) =>
+    a.localeCompare(b)
+  );
+  for (const [name, value] of units) {
+    lines.push(`- ${name}: ${value}`);
+  }
+  return lines.join("\n");
+}
+
+function registerAnalysisCommands(context: ExtensionContext): void {
+  const output = vscode.window.createOutputChannel("Dynare Analysis");
+
+  async function run(command: string, title: string, render: (value: any) => string) {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || editor.document.languageId !== "dynare") {
+      void vscode.window.showInformationMessage(
+        `${title} requires an active Dynare .mod or .inc document.`
+      );
+      return;
+    }
+    try {
+      maybeStartClientForDocument(context, editor.document);
+      if (clientStartPromise) {
+        await clientStartPromise;
+      }
+      const targetClient = client;
+      if (!targetClient || !targetClient.isRunning()) {
+        void vscode.window.showErrorMessage(
+          "Dynare language server is not running. Check dynare.pythonPath."
+        );
+        return;
+      }
+      const result = await targetClient.sendRequest<any>("workspace/executeCommand", {
+        command,
+        arguments: [{ uri: editor.document.uri.toString() }],
+      });
+      output.clear();
+      output.appendLine(render(result));
+      output.show(true);
+    } catch (err) {
+      output.clear();
+      output.appendLine(`${title} failed: ${String(err)}`);
+      output.show(true);
+      void vscode.window.showErrorMessage(`${title} failed; see Dynare Analysis output.`);
+    }
   }
 
-  const didChange = new vscode.EventEmitter<void>();
-
   context.subscriptions.push(
+    output,
+    vscode.commands.registerCommand("dynare.traceIncludes", () =>
+      run("dynare/traceIncludes", "Trace Dynare Includes", renderIncludeTrace)
+    ),
+    vscode.commands.registerCommand("dynare.profileAnalysis", () =>
+      run("dynare/profileAnalysis", "Profile Dynare Analysis", renderAnalysisProfile)
+    )
+  );
+}
+
+function registerMcpProvider(context: ExtensionContext): void {
+  // Register the bundled MCP server only when the host supports the stable API.
+  const lm: any = (vscode as any).lm;
+  const Def: any = (vscode as any).McpStdioServerDefinition;
+  if (!lm || typeof lm.registerMcpServerDefinitionProvider !== "function" || typeof Def !== "function") return;
+  const didChange = new vscode.EventEmitter<void>();
+  context.subscriptions.push(
+    didChange,
     lm.registerMcpServerDefinitionProvider("dynare.mcpServerProvider", {
       onDidChangeMcpServerDefinitions: didChange.event,
       provideMcpServerDefinitions: () => {
         const command = configuredPythonPath();
-        const args = ["-m", "dynare_lsp.mcp_server"];
-        // The stable API uses a positional constructor
-        // (label, command, args, env?, version?). Build positionally, then
-        // fall back to an options-object form if a build expects that instead,
-        // so this does not depend on a single constructor shape.
+        const args = ["-m", "dynare_lsp.mcp_preflight_server"];
         let def: any = new Def("Dynare MCP", command, args);
-        if (!def || def.command !== command) {
-          def = new Def({ label: "Dynare MCP", command, args });
-        }
+        if (!def || def.command !== command) def = new Def({ label: "Dynare MCP", command, args });
         return [def];
       },
     }),
     workspace.onDidChangeConfiguration((event) => {
-      if (event.affectsConfiguration("dynare.pythonPath")) {
-        didChange.fire();
-      }
+      if (event.affectsConfiguration("dynare.pythonPath")) didChange.fire();
     })
   );
 }
 
 export function activate(context: ExtensionContext) {
   registerMcpProvider(context);
+  registerAnalysisReport(context, async () => {
+    maybeStartClientForOpenDynareDocument(context);
+    if (clientStartPromise) await clientStartPromise;
+    return client;
+  });
+  // Preserve the old command ID, but route it to actual versioned evidence.
+  context.subscriptions.push(vscode.commands.registerCommand("dynare.showPreflightStatus", (uri?: vscode.Uri) =>
+    vscode.commands.executeCommand("dynare.showAnalysisReport", uri)));
+  registerAnalysisCommands(context);
   maybeStartClientForOpenDynareDocument(context);
   context.subscriptions.push(
     workspace.onDidOpenTextDocument((document) => {
@@ -300,16 +412,9 @@ export function deactivate(): Thenable<void> | undefined {
   clientGeneration += 1;
   client = undefined;
   clientStartPromise = undefined;
-
-  if (!activeClient && !pendingStart) {
-    return undefined;
-  }
+  if (!activeClient && !pendingStart) return undefined;
   return (async () => {
-    if (pendingStart) {
-      await pendingStart;
-    }
-    if (activeClient) {
-      await stopClient(activeClient);
-    }
+    if (pendingStart) await pendingStart;
+    if (activeClient) await stopClient(activeClient);
   })();
 }

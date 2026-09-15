@@ -344,3 +344,56 @@ def _separator(prev_kind: Optional[str], kind: str) -> str:
         return " "
     # operand/rparen followed by operand -> single space (e.g. ``var y c``).
     return " "
+
+
+def format_on_type(
+    text: str,
+    line: int,
+    character: int,
+    trigger: str,
+    indent_unit: str = "\t",
+) -> Optional[Tuple[int, int, str]]:
+    """Return a leading-whitespace edit after ``newline`` or ``;``.
+
+    On-type formatting is intentionally narrower than document formatting: it
+    never spaces operators, aligns assignments, or changes comments.  It only
+    replaces the current line's leading spaces/tabs with the indentation implied
+    by already-open Dynare blocks.  The returned tuple is
+    ``(line, old_indent_characters, new_indent)``.
+    """
+    if trigger not in {"\n", ";"} or line < 0:
+        return None
+    raw_lines = text.split("\n")
+    if line >= len(raw_lines):
+        return None
+    orig_line = raw_lines[line].rstrip("\r")
+    stripped_lines = [
+        item.rstrip("\r") for item in _strip_comments(text).split("\n")
+    ]
+    if line >= len(stripped_lines):
+        return None
+    stripped_line = stripped_lines[line]
+
+    # Comment-only and macro-directive lines are preserved verbatim.  A blank
+    # line is still eligible so pressing Enter inside a block indents it.
+    if stripped_line.strip() == "" and orig_line.strip() != "":
+        return None
+
+    source_character = max(0, min(character, len(orig_line)))
+    if trigger == ";":
+        # Ignore semicolons inside strings/comments or before later code.
+        code_before_cursor = stripped_line[:source_character].rstrip()
+        code_after_cursor = stripped_line[source_character:].strip()
+        if not code_before_cursor.endswith(";") or code_after_cursor:
+            return None
+
+    depth = _depth_before(stripped_lines, line)
+    structural = _structural_line(stripped_line)
+    if _END_RE.fullmatch(structural):
+        depth = max(0, depth - 1)
+    expected = indent_unit * depth
+    match = re.match(r"[ \t]*", orig_line)
+    old_indent = match.group(0) if match is not None else ""
+    if old_indent == expected:
+        return None
+    return line, len(old_indent), expected

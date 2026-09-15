@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 from statistics import NormalDist
 from typing import Dict, List, Optional, Tuple
 
+from .performance import record_work
+
 logger = logging.getLogger(__name__)
 
 
@@ -1956,14 +1958,32 @@ def _strip_equation_tags_from_text(text: str) -> str:
 
 
 def _inside_quoted_string(text: str, offset: int) -> bool:
+    """Return whether *offset* is in code quoted before it, ignoring comments."""
     quote: Optional[str] = None
     i = 0
     while i < min(offset, len(text)):
         ch = text[i]
         if quote is not None:
             if ch == quote:
+                if i + 1 < offset and text[i + 1] == quote:
+                    i += 2
+                    continue
+                quote = None
+            elif ch in "\r\n":
                 quote = None
             i += 1
+            continue
+        if ch == "%" or text.startswith("//", i):
+            newline = text.find("\n", i + 1, offset)
+            if newline < 0:
+                return False
+            i = newline + 1
+            continue
+        if text.startswith("/*", i):
+            end = text.find("*/", i + 2, offset)
+            if end < 0:
+                return False
+            i = end + 2
             continue
         if ch in ('"', "'"):
             quote = ch
@@ -4752,6 +4772,8 @@ def parse(
     line_macro_defines: Optional[Dict[int, Dict[str, str]]] = None,
 ) -> ParsedModel:
     """Parse a Dynare .mod file and return a structured AST with positions."""
+    record_work("parse.calls")
+    record_work("parse.characters", len(text))
     original_text = text
     # Python's line-oriented regexes and position cache recognize LF/CRLF.
     # Normalize lone CR in place (same width) so old-Mac input has identical

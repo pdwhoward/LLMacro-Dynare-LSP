@@ -67,7 +67,8 @@ pip install -e ".[all]"
 Two console scripts are installed:
 
 - `dynare-lsp` — the language server / CLI (equivalent to `python -m dynare_lsp`)
-- `dynare-mcp` — the MCP server (equivalent to `python -m dynare_lsp.mcp_server`)
+- `dynare-mcp` — the MCP server with the consolidated preflight tool (equivalent to
+  `python -m dynare_lsp.mcp_preflight_server`)
 
 ## Command-line use
 
@@ -110,7 +111,7 @@ registers both the language server and the MCP server. Its
                 "extensionToLanguage": { ".mod": "dynare", ".inc": "dynare" } }
   },
   "mcpServers": {
-    "dynare": { "command": "python", "args": ["-m", "dynare_lsp.mcp_server"] }
+    "dynare": { "command": "python", "args": ["-m", "dynare_lsp.mcp_preflight_server"] }
   }
 }
 ```
@@ -118,33 +119,34 @@ registers both the language server and the MCP server. Its
 Add `claude-code-plugin/` as a local plugin marketplace in Claude Code, then
 install the `dynare-lsp` plugin. Install the Python package with the MCP extra
 first so both `python -m dynare_lsp` and
-`python -m dynare_lsp.mcp_server` resolve in your environment.
+`python -m dynare_lsp.mcp_preflight_server` resolve in your environment.
 
 ## Codex
 
-Codex can use the analysis engine through the MCP server. After installing the
-package with the MCP extra, add this to `~/.codex/config.toml` (or to a trusted
-project's `.codex/config.toml`):
+Codex can use the analysis engine and consolidated preflight through the default
+MCP server. After installing the package with the MCP extra, add this to
+`~/.codex/config.toml` (or to a trusted project's `.codex/config.toml`):
 
 ```toml
 [mcp_servers.dynare]
 command = "python"
-args = ["-m", "dynare_lsp.mcp_server"]
+args = ["-m", "dynare_lsp.mcp_preflight_server"]
 ```
 
 Alternatively, register it from the command line:
 
 ```bash
-codex mcp add dynare -- python -m dynare_lsp.mcp_server
+codex mcp add dynare -- python -m dynare_lsp.mcp_preflight_server
 codex mcp list
 ```
 
 Pin `command` to the full interpreter path when `python` on `PATH` is not the
 environment where `dynare-lsp[mcp]` is installed.
 
-## MCP server (standalone)
+## Base MCP server
 
-To use the MCP server with any MCP client, run:
+The base server exposes the granular tool catalog without adding the
+consolidated `dynare_preflight` orchestration tool:
 
 ```bash
 python -m dynare_lsp.mcp_server

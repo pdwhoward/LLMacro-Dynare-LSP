@@ -22,7 +22,12 @@
   ],
   "activationEvents": [
     "onLanguage:dynare",
-    "onStartupFinished"
+    "onStartupFinished",
+    "onCommand:dynare.traceIncludes",
+    "onCommand:dynare.profileAnalysis",
+    "onCommand:dynare.showPreflightStatus",
+    "onCommand:dynare.showAnalysisReport",
+    "onCommand:dynare.analysisTools"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -57,7 +62,7 @@
         },
         "dynare.steadyStateTolerance": {
           "type": "number",
-          "default": 1e-6,
+          "default": 1e-06,
           "description": "Tolerance for steady state equation residuals"
         },
         "dynare.preprocessorPath": {
@@ -67,13 +72,18 @@
         },
         "dynare.searchPaths": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "default": [],
           "scope": "resource",
           "description": "Additional directories consulted by @#include resolution. Project-wide complement to per-file @#includepath directives."
         },
         "dynare.formatIndent": {
-          "type": ["string", "number"],
+          "type": [
+            "string",
+            "number"
+          ],
           "default": "tab",
           "description": "Indentation unit used by the Dynare document formatter: \"tab\", or a number of spaces (1-8)."
         }
@@ -83,6 +93,28 @@
       {
         "id": "dynare.mcpServerProvider",
         "label": "Dynare MCP"
+      }
+    ],
+    "commands": [
+      {
+        "command": "dynare.traceIncludes",
+        "title": "Dynare: Trace Macro/Include Resolution"
+      },
+      {
+        "command": "dynare.profileAnalysis",
+        "title": "Dynare: Profile Native Analysis Work"
+      },
+      {
+        "command": "dynare.showPreflightStatus",
+        "title": "Dynare: Show Preflight Status"
+      },
+      {
+        "command": "dynare.showAnalysisReport",
+        "title": "Dynare: Show Versioned Analysis Report"
+      },
+      {
+        "command": "dynare.analysisTools",
+        "title": "Dynare: Analysis Tools"
       }
     ]
   },

@@ -21,7 +21,6 @@ from .diagnostics import Diagnostic, Severity
 from .steady_state import (
     _TIME_SUBSCRIPT,
     _TIME_SUBSCRIPT_FUNCTION_NAMES,
-    _STEADY_STATE_OP,
     _LOCAL_VAR_DEF,
     _build_eval_env,
     _escape_expr,
@@ -140,12 +139,9 @@ def _extract_variable_timing(model: ParsedModel) -> Dict[str, Set[int]]:
                 )
             subscripted_spans.add((m.start(), m.end()))
 
-        # Replace steady_state(x) so those don't show as bare identifiers
-        text_no_ss = _STEADY_STATE_OP.sub("__SS__", text)
-
         # Remove subscripted matches to find bare identifiers (time 0)
-        # Work backwards to preserve positions
-        chars = list(text_no_ss)
+        # Work backwards against the same offset-preserving text scanned above.
+        chars = list(text)
         for start, end in sorted(subscripted_spans, reverse=True):
             if end <= len(chars):
                 for i in range(start, min(end, len(chars))):
