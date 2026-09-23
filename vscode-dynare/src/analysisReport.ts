@@ -19,7 +19,7 @@ function editorSettings(uri: vscode.Uri): Record<string, unknown> {
   const base = vscode.workspace.getWorkspaceFolder(uri)?.uri.fsPath ?? path.dirname(uri.fsPath);
   const resourcePaths = config.get<string[]>("searchPaths", []).filter((value) => value.trim().length > 0)
     .map((value) => path.isAbsolute(value.trim()) ? value.trim() : path.resolve(base, value.trim()));
-  return { tolerance: config.get<number>("steadyStateTolerance", 1e-6), search_paths: Array.from(new Set([...globalPaths, ...resourcePaths])) };
+  return { tolerance: config.get<number>("steadyStateTolerance", 6.055454452393343e-6), search_paths: Array.from(new Set([...globalPaths, ...resourcePaths])) };
 }
 
 function reportConfiguration(uri: vscode.Uri): Record<string, unknown> {

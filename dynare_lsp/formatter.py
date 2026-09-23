@@ -45,11 +45,16 @@ _BLOCK_OPENERS = (
     "irf_calibration",
     "verbatim",
 )
+# Dynare's lexer treats only space and tab (plus line breaks) as whitespace
+# (``SPC [ \t]+`` in DynareFlex.ll).  Every whitespace test below uses exactly
+# that set: Python's ``str.strip()`` / ``\s`` also match Unicode spaces such as
+# U+00A0, which are lexer ERRORS in Dynare and must never be "fixed" away.
+_WS = " \t"
 _OPENER_RE = re.compile(
-    r"\s*(?:" + "|".join(_BLOCK_OPENERS) + r")\b\s*(?:\([^)]*\))?\s*;\s*",
+    r"[ \t]*(?:" + "|".join(_BLOCK_OPENERS) + r")\b[ \t]*(?:\([^)]*\))?[ \t]*;[ \t]*",
     re.IGNORECASE,
 )
-_END_RE = re.compile(r"\s*end\s*;\s*", re.IGNORECASE)
+_END_RE = re.compile(r"[ \t]*end[ \t]*;[ \t]*", re.IGNORECASE)
 
 # Tokens of a "simple" expression line (no strings/tags/macros).
 _SIMPLE_TOKEN_RE = re.compile(
@@ -75,7 +80,7 @@ _CANONICAL_TOKEN_RE = re.compile(
     r"|\d+\.?\d*(?:[eE][+-]?\d+)?"
     r"|\.\d+(?:[eE][+-]?\d+)?"
     r"|==|!=|<=|>=|&&|\|\||\*\*"
-    r"|\S"
+    r"|[^ \t\r\n]"  # anything Dynare does not skip, incl. Unicode spaces
 )
 
 # Identifier glued to macro interpolation(s) (``e_xi@{index}``): whitespace
@@ -174,30 +179,30 @@ def _format_lines(
         assign_run.clear()
 
     for orig, stripped in zip(orig_lines, stripped_lines):
-        code = stripped.rstrip()
+        code = stripped.rstrip(_WS)
         structural = _structural_line(stripped)
 
-        if code.strip() == "":
+        if code.strip(_WS) == "":
             # No code on this line: blank, comment-only, or macro directive.
             _flush_run()
-            if orig.strip() == "":
+            if orig.strip(_WS) == "":
                 if out and out[-1] == "":
                     continue  # collapse consecutive blank lines
                 out.append("")
             else:
-                out.append(orig.rstrip())  # comment / @# line, verbatim content
+                out.append(orig.rstrip(_WS))  # comment / @# line, verbatim content
             continue
 
         if _END_RE.fullmatch(structural):
             _flush_run()
             depth = max(0, depth - 1)
-            out.append(indent_unit * depth + orig.strip())
+            out.append(indent_unit * depth + orig.strip(_WS))
             continue
 
         indent = indent_unit * depth
         code_end = len(code)
         body = orig[:code_end]
-        trailing = orig[code_end:].strip()  # inline comment, verbatim
+        trailing = orig[code_end:].strip(_WS)  # inline comment, verbatim
 
         if trailing and not trailing.startswith(("//", "%", "/*")):
             # The blanked tail is not a comment — it is macro content such as
@@ -205,15 +210,15 @@ def _format_lines(
             # it after a spaced body would inject whitespace into the
             # expanded token (``e_xi 7``), so keep the line verbatim.
             _flush_run()
-            out.append(indent + orig.strip())
+            out.append(indent + orig.strip(_WS))
             if _OPENER_RE.fullmatch(structural):
                 depth += 1
             continue
 
         no_midline_comment = orig[:code_end] == stripped[:code_end]
-        spaced = _space_line(body.strip()) if no_midline_comment else None
+        spaced = _space_line(body.strip(_WS)) if no_midline_comment else None
 
-        line_body = spaced if spaced is not None else body.strip()
+        line_body = spaced if spaced is not None else body.strip(_WS)
         line = indent + line_body
         if trailing:
             line += " " + trailing
@@ -293,7 +298,7 @@ def _space_line(code: str) -> Optional[str]:
     if any(ch in _UNSAFE_CHARS for ch in code):
         return None
     tokens = _SIMPLE_TOKEN_RE.findall(code)
-    if "".join(tokens) != re.sub(r"\s+", "", code):
+    if "".join(tokens) != re.sub(r"[ \t]+", "", code):
         return None  # unrecognised characters -> don't touch
     return _join_tokens(tokens)
 
@@ -376,14 +381,14 @@ def format_on_type(
 
     # Comment-only and macro-directive lines are preserved verbatim.  A blank
     # line is still eligible so pressing Enter inside a block indents it.
-    if stripped_line.strip() == "" and orig_line.strip() != "":
+    if stripped_line.strip(_WS) == "" and orig_line.strip(_WS) != "":
         return None
 
     source_character = max(0, min(character, len(orig_line)))
     if trigger == ";":
         # Ignore semicolons inside strings/comments or before later code.
-        code_before_cursor = stripped_line[:source_character].rstrip()
-        code_after_cursor = stripped_line[source_character:].strip()
+        code_before_cursor = stripped_line[:source_character].rstrip(_WS)
+        code_after_cursor = stripped_line[source_character:].strip(_WS)
         if not code_before_cursor.endswith(";") or code_after_cursor:
             return None
 

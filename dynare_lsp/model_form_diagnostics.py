@@ -205,9 +205,13 @@ def _check_steady_state_model(
 # E066-E069 / W054-W055 -- histval and deterministic initialization
 # ---------------------------------------------------------------------------
 
+# One histval statement (``name(lag) = expr``); applied to each
+# ``;``-terminated statement so several statements on one line
+# (``histval; y(0)=1; y(-1)=0.5; end;``) are all seen.
 _HIST_ASSIGN_RE = re.compile(
-    r"(?m)^\s*([A-Za-z_]\w*)\s*(?:\(\s*([+-]?\d+)\s*\))?\s*=\s*([^;]+);"
+    r"\s*([A-Za-z_]\w*)\s*(?:\(\s*([+-]?\d+)\s*\))?\s*=\s*([^;]+);"
 )
+_HIST_STATEMENT_RE = re.compile(r"[^;]*;")
 
 
 def _check_histval(model: ParsedModel) -> List[Diagnostic]:
@@ -271,10 +275,13 @@ def _check_histval(model: ParsedModel) -> List[Diagnostic]:
     for block in hist_blocks:
         body = block.group(2)
         body_start = block.start(2)
-        for match in _HIST_ASSIGN_RE.finditer(body):
+        for statement in _HIST_STATEMENT_RE.finditer(body):
+            match = _HIST_ASSIGN_RE.match(statement.group(0))
+            if match is None:
+                continue
             name = match.group(1)
             offset = int(match.group(2) or "0")
-            start = body_start + match.start(1)
+            start = body_start + statement.start() + match.start(1)
             rng = SourceRange(
                 _offset_to_position(model.text, start),
                 _offset_to_position(model.text, start + len(name)),
@@ -318,29 +325,61 @@ def _check_histval(model: ParsedModel) -> List[Diagnostic]:
     all_values_required = bool(re.search(
         r"(?<!\w)histval\s*\(\s*all_values_required\s*\)", stripped, re.I
     ))
+    # Dynare's histval periods: period 0 is the last pre-simulation period, so
+    # a variable entering with maximum lag L needs x(0), x(-1), ..., x(-(L-1))
+    # (the manual's ``x = 1.5*x(-1) - 0.6*x(-2)`` example sets x(0), x(-1)).
+    # Missing values default to zero (manual: "assumed to have a value of
+    # zero at period 0 and before"), so this is a warning.
     for name in sorted(state_names):
-        required_lags = sorted(
-            offset for offset in state_offsets.get(name, set()) if offset < 0
-        )
-        missing = [offset for offset in required_lags if offset not in supplied.get(name, set())]
+        max_lag = -min(state_offsets.get(name, {0}) | {0})
+        required_periods = [-k for k in range(max_lag)]
+        missing = [
+            period for period in required_periods
+            if period not in supplied.get(name, set())
+        ]
         if not missing:
             continue
-        rendered = ", ".join(f"{name}({offset})" for offset in missing)
-        severity = Severity.ERROR if all_values_required else Severity.WARNING
+        rendered = ", ".join(f"{name}({period})" for period in missing)
         diagnostics.append(Diagnostic(
             range=hist_anchor,
-            severity=severity,
+            severity=Severity.WARNING,
             message=(
                 f"histval does not provide required historical state value(s): "
-                f"{rendered}. " + (
-                    "all_values_required makes missing values an error."
-                    if all_values_required
-                    else "Dynare will initialize missing historical values to zero."
-                )
+                f"{rendered}. Dynare will initialize missing historical values "
+                "to zero."
             ),
             source="dynare",
             code="W055",
         ))
+
+    if all_values_required:
+        # HistValStatement::checkPass: with all_values_required, every
+        # endogenous and every exogenous variable must appear in histval
+        # (at any lag); otherwise the preprocessor stops with an error.
+        missing_endo = sorted(
+            v for v in model.endogenous_names() if v not in supplied
+        )
+        missing_exo = sorted(
+            v for v in model.exogenous_names() if v not in supplied
+        )
+        if missing_endo or missing_exo:
+            parts = []
+            if missing_endo:
+                parts.append("endogenous " + ", ".join(missing_endo))
+            if missing_exo:
+                parts.append("exogenous " + ", ".join(missing_exo))
+            diagnostics.append(Diagnostic(
+                range=hist_anchor,
+                severity=Severity.ERROR,
+                message=(
+                    "histval(all_values_required) does not set the following "
+                    "variable(s): " + "; ".join(parts) + ". Dynare requires "
+                    "every endogenous and exogenous variable to appear in "
+                    "histval when all_values_required is given."
+                ),
+                source="dynare",
+                code="W055",
+            ))
     return diagnostics
 
 

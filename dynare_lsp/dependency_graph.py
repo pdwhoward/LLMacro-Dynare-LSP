@@ -91,6 +91,25 @@ def patch_workspace_index(workspace_module) -> None:
     cls.dependency_graph = dependency_graph
 
 
+_UNRESOLVED_INCLUDE_CODE = "E061"
+_FILE_CHANGE_CREATED = 1
+
+
+def _is_created_event(event) -> bool:
+    change_type = getattr(event, "type", None)
+    if change_type is None and isinstance(event, dict):
+        change_type = event.get("type")
+    return getattr(change_type, "value", change_type) == _FILE_CHANGE_CREATED
+
+
+def _has_unresolved_include(core, uri: str) -> bool:
+    """Caller holds ``core._state_lock``."""
+    return any(
+        getattr(diagnostic, "code", None) == _UNRESOLVED_INCLUDE_CODE
+        for diagnostic in core._document_diagnostics.get(uri, ())
+    )
+
+
 def install(core) -> None:
     if getattr(core, "_dependency_invalidation_installed", False):
         return
@@ -138,8 +157,11 @@ def install(core) -> None:
 
     def watched_files(params):
         affected = set()
+        created = False
         for event in params.changes:
             affected.update(core._workspace_index.dependent_roots(event.uri))
+            if _is_created_event(event):
+                created = True
             try:
                 core._workspace_index.remove_document(event.uri)
             except Exception:
@@ -149,6 +171,10 @@ def install(core) -> None:
                 uri
                 for uri in core._document_models
                 if core._normalize_uri(uri) in affected
+                # A missing include is not in the dependency graph, so a
+                # newly created file must also recheck every open document
+                # that currently reports an unresolved include (E061).
+                or (created and _has_unresolved_include(core, uri))
             ]
         for uri in uris:
             try:

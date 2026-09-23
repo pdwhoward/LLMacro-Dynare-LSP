@@ -17,7 +17,7 @@ from pkgutil import iter_modules
 from types import ModuleType
 from typing import Optional, Sequence
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 _TARGETS = {
     f"{__name__}.server",
@@ -114,14 +114,15 @@ class _ExtensionLoader(importlib.abc.Loader):
                     @functools.wraps(function)
                     def did_close(params, *feature_args, **feature_kwargs):
                         uri = params.text_document.uri
-                        for callback in tuple(
-                            runtime_dispatch.document_close_callbacks
-                        ):
-                            try:
-                                callback(uri)
-                            except Exception:
-                                pass
-                        return function(params, *feature_args, **feature_kwargs)
+                        with runtime_dispatch.document_lifecycle_gate(uri):
+                            for callback in tuple(
+                                runtime_dispatch.document_close_callbacks
+                            ):
+                                try:
+                                    callback(uri)
+                                except Exception:
+                                    pass
+                            return function(params, *feature_args, **feature_kwargs)
 
                     return register(did_close)
 

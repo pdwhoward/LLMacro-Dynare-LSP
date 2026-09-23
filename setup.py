@@ -10,7 +10,7 @@ except FileNotFoundError:
 
 setup(
     name="dynare-lsp",
-    version="0.4.0",
+    version="0.5.0",
     description="Language Server Protocol implementation for the Dynare modeling language",
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -23,8 +23,8 @@ setup(
     packages=find_packages(),
     python_requires=">=3.11",
     install_requires=[
-        "pygls>=1.0.0",
-        "lsprotocol>=2023.0.0",
+        "pygls>=2.0.0,<3",
+        "lsprotocol>=2025.0.0",
     ],
     extras_require={
         "solver": [
@@ -47,6 +47,7 @@ setup(
             "numpy>=1.20.0",
             "scipy>=1.7.0",
             "sympy>=1.12",
+            "mcp>=1.26.0,<2",
         ],
     },
     entry_points={

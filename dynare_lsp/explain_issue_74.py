@@ -9,6 +9,6 @@ _ENTRIES.update({
     },
     "W097": {
         "title": "Invalid prior hyperparameters",
-        "body": "The prior's literal hyperparameters are mathematically invalid: a standard deviation/scale is non-positive or non-finite, or a beta mean/standard-deviation pair would imply non-positive beta shape parameters. Symbolic expressions that cannot be evaluated are left to Dynare.",
+        "body": "The prior's literal hyperparameters are mathematically invalid: a standard deviation/scale is non-positive or non-finite (an infinite standard deviation is accepted for inverse-gamma priors, as in Dynare), or a beta mean/standard-deviation pair would imply non-positive beta shape parameters. Symbolic expressions that cannot be evaluated are left to Dynare.",
     },
 })

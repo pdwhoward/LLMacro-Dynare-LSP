@@ -8,6 +8,21 @@ from .analysis_api import features
 from .analysis_service import json_safe
 
 
+def _read_source(path: Path) -> str:
+    """Read a model like ``WorkspaceIndex._read_and_parse_from_disk``.
+
+    UTF-8 first; legacy cp1252/latin-1 files (common in older Dynare
+    projects, and accepted by the byte-tolerant preprocessor) fall back to
+    latin-1, which decodes any byte and keeps offsets 1:1.
+    """
+    data = path.read_bytes()
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = data.decode("latin-1")
+    return text
+
+
 def main(argv=None) -> int:
     choices = {m.CLI: m.TOOL for m in features()}
     parser = argparse.ArgumentParser(description=__doc__)
@@ -18,8 +33,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.file:
-            with args.file.open(encoding="utf-8", newline="") as stream:
-                request = {"file_content": stream.read(), "active_file": str(args.file.resolve())}
+            request = {"file_content": _read_source(args.file), "active_file": str(args.file.resolve())}
         else:
             request = json.loads(args.request.read_text(encoding="utf-8-sig") if args.request else sys.stdin.read())
         if not isinstance(request, dict):

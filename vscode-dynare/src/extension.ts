@@ -1,3 +1,4 @@
+import { execFile } from "child_process";
 import * as path from "path";
 import * as vscode from "vscode";
 import { workspace, ExtensionContext, WorkspaceFolder } from "vscode";
@@ -12,6 +13,15 @@ let client: LanguageClient | undefined;
 let clientStartPromise: Promise<void> | undefined;
 let clientGeneration = 0;
 let currentPythonPath = "python";
+// Shared across client generations so restarts do not leak watchers or
+// output channels; created once in activate() and owned by context.subscriptions.
+let fileWatchers: vscode.FileSystemWatcher[] = [];
+let serverOutputChannel: vscode.OutputChannel | undefined;
+// Report a failed start once per interpreter path instead of on every open.
+let reportedStartFailurePath: string | undefined;
+
+const INSTALL_COMMAND =
+  'pip install "dynare-lsp[all] @ git+https://github.com/pdwhoward/LLMacro-Dynare-LSP.git"';
 
 function configuredPythonPath(): string {
   const config = workspace.getConfiguration("dynare");
@@ -62,7 +72,7 @@ function dynareConfigurationPayload() {
   return {
     dynare: {
       pythonPath: config.get<string>("pythonPath", "python"),
-      steadyStateTolerance: config.get<number>("steadyStateTolerance", 1e-6),
+      steadyStateTolerance: config.get<number>("steadyStateTolerance", 6.055454452393343e-6),
       preprocessorPath: config.get<string>("preprocessorPath", ""),
       formatIndent: config.get<string | number>("formatIndent", "tab"),
       searchPaths: configuredSearchPaths(),
@@ -96,11 +106,9 @@ function createClient(pythonPath: string): LanguageClient {
 
   const clientOptions: LanguageClientOptions = {
     documentSelector: [{ scheme: "file", language: "dynare" }],
+    outputChannel: serverOutputChannel,
     synchronize: {
-      fileEvents: [
-        workspace.createFileSystemWatcher("**/*.mod"),
-        workspace.createFileSystemWatcher("**/*.inc"),
-      ],
+      fileEvents: fileWatchers,
     },
   };
 
@@ -112,6 +120,20 @@ function createClient(pythonPath: string): LanguageClient {
   );
 }
 
+function ensureSharedResources(context: ExtensionContext): void {
+  if (fileWatchers.length === 0) {
+    fileWatchers = [
+      workspace.createFileSystemWatcher("**/*.mod"),
+      workspace.createFileSystemWatcher("**/*.inc"),
+    ];
+    context.subscriptions.push(...fileWatchers);
+  }
+  if (!serverOutputChannel) {
+    serverOutputChannel = vscode.window.createOutputChannel("Dynare Language Server");
+    context.subscriptions.push(serverOutputChannel);
+  }
+}
+
 async function stopClient(targetClient: LanguageClient): Promise<void> {
   if (!targetClient.isRunning()) {
     return;
@@ -120,6 +142,59 @@ async function stopClient(targetClient: LanguageClient): Promise<void> {
     await targetClient.stop();
   } catch (err) {
     console.warn("Failed to stop Dynare language client", err);
+  }
+}
+
+function probePythonEnvironment(pythonPath: string): Promise<string> {
+  // Diagnose a failed start without delaying the normal (successful) path.
+  return new Promise((resolve) => {
+    execFile(
+      pythonPath,
+      ["-c", "import dynare_lsp"],
+      { timeout: 20000, windowsHide: true },
+      (err: any, _stdout, stderr) => {
+        if (!err) {
+          resolve(
+            `The interpreter "${pythonPath}" imports dynare_lsp, but the server exited ` +
+              "during startup. See the Dynare Language Server output for details."
+          );
+        } else if (err.code === "ENOENT") {
+          resolve(`Python interpreter "${pythonPath}" was not found.`);
+        } else {
+          const detail = String(stderr || err.message || "")
+            .trim()
+            .split(/\r?\n/)
+            .pop();
+          resolve(
+            `The interpreter "${pythonPath}" cannot import dynare_lsp` +
+              `${detail ? ` (${detail})` : ""}.`
+          );
+        }
+      }
+    );
+  });
+}
+
+async function reportStartFailure(pythonPath: string, err: unknown): Promise<void> {
+  serverOutputChannel?.appendLine(`Dynare language server failed to start: ${String(err)}`);
+  if (reportedStartFailurePath === pythonPath) {
+    return;
+  }
+  reportedStartFailurePath = pythonPath;
+  const reason = await probePythonEnvironment(pythonPath);
+  const openSettings = "Open dynare.pythonPath Setting";
+  const showOutput = "Show Output";
+  const choice = await vscode.window.showErrorMessage(
+    `Dynare language server could not start. ${reason} Set "dynare.pythonPath" to a ` +
+      `Python 3.11+ interpreter (on macOS/Linux often "python3") where the server is ` +
+      `installed, e.g. ${INSTALL_COMMAND}.`,
+    openSettings,
+    showOutput
+  );
+  if (choice === openSettings) {
+    await vscode.commands.executeCommand("workbench.action.openSettings", "dynare.pythonPath");
+  } else if (choice === showOutput) {
+    serverOutputChannel?.show(true);
   }
 }
 
@@ -149,9 +224,11 @@ function startClient(context: ExtensionContext, pythonPath: string): void {
       return;
     }
 
+    ensureSharedResources(context);
+    // Not pushed into context.subscriptions: each restart would otherwise
+    // retain every previous client. deactivate() stops the active client.
     const nextClient = createClient(pythonPath);
     client = nextClient;
-    context.subscriptions.push(nextClient);
 
     try {
       await nextClient.start();
@@ -160,8 +237,12 @@ function startClient(context: ExtensionContext, pythonPath: string): void {
         client = undefined;
       }
       console.error("Dynare language server failed to start", err);
+      if (generation === clientGeneration) {
+        void reportStartFailure(pythonPath, err);
+      }
       return;
     }
+    reportedStartFailurePath = undefined;
 
     if (generation !== clientGeneration || client !== nextClient) {
       await stopClient(nextClient);
@@ -367,6 +448,7 @@ function registerMcpProvider(context: ExtensionContext): void {
 }
 
 export function activate(context: ExtensionContext) {
+  ensureSharedResources(context);
   registerMcpProvider(context);
   registerAnalysisReport(context, async () => {
     maybeStartClientForOpenDynareDocument(context);

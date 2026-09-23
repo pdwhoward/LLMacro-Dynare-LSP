@@ -11,10 +11,18 @@ Two helpers are exposed here:
 * :func:`resolve_include_path` — given the literal filename from inside
   the directive plus the URI of the including file, return the absolute
   :class:`pathlib.Path` of the file on disk, or ``None`` when no candidate
-  matches.  Resolution mimics the Dynare preprocessor:
+  matches.  With *working_dir* (the directory of the entry ``.mod`` file,
+  which is Dynare's process working directory) resolution matches the
+  Dynare 7.1 macro processor (``macro/Directives.cc``):
 
-    1. relative to the directory of the including file
+    1. relative to the working directory — NOT the including file
     2. each entry in *search_paths*, in order
+
+  Dynare never looks next to the including file.  Callers that only need
+  editor navigation may keep that as a lenient fallback
+  (``strict=False``); diagnostics pass ``strict=True``.  Without
+  *working_dir* the legacy order (including file's directory first) is
+  used, which is identical for top-level includes.
 
 * :func:`find_workspace_root` — walks up from a starting path until it
   finds a directory containing ``.git`` (or runs out of parents).  Used
@@ -73,6 +81,8 @@ def resolve_include_path(
     known_paths: Optional[set] = None,
     *,
     known_only: bool = False,
+    working_dir: Optional[Path] = None,
+    strict: bool = False,
 ) -> Optional[Path]:
     """Resolve the absolute path of a ``@#include`` target.
 
@@ -95,6 +105,13 @@ def resolve_include_path(
     rule applies on both sides of the comparison.
     With *known_only*, only supplied paths participate, even when other
     candidates exist on disk. This preserves supplied-only snapshot semantics.
+
+    *working_dir* is the directory Dynare runs in (the entry model's folder).
+    When given, it replaces the including file's directory as the first
+    candidate, matching Dynare.  Unless *strict*, the including file's
+    directory is still tried after every Dynare candidate, so go-to-definition
+    keeps working for layouts Dynare itself rejects; unresolved-include
+    diagnostics pass ``strict=True`` so they agree with the preprocessor.
     """
     record_work("include_resolution.calls")
     if not directive_filename:
@@ -176,22 +193,36 @@ def resolve_include_path(
     else:
         including_dir = including_path
 
-    # 1. Relative to the including file's directory.
-    candidate = (including_dir / candidate_rel)
-    if _matches(candidate):
+    def _hit(p: Path) -> Optional[Path]:
+        if not _matches(p):
+            return None
         try:
-            return candidate.resolve()
+            return p.resolve()
         except (OSError, RuntimeError):
-            return candidate
+            return p
 
-    # 2. Each search path, in order.
+    # 1. Relative to Dynare's working directory (legacy: the including file's
+    #    directory, which is the same thing for the entry file itself).
+    first_dir = working_dir if working_dir is not None else including_dir
+    hit = _hit(first_dir / candidate_rel)
+    if hit is not None:
+        return hit
+
+    # 2. Each search path, in order.  A relative search path is relative to
+    #    the working directory, exactly as Dynare opens ``dir / filename``.
     for sp in search_paths or []:
-        candidate = sp / candidate_rel
-        if _matches(candidate):
-            try:
-                return candidate.resolve()
-            except (OSError, RuntimeError):
-                return candidate
+        if working_dir is not None and not sp.is_absolute():
+            sp = working_dir / sp
+        hit = _hit(sp / candidate_rel)
+        if hit is not None:
+            return hit
+
+    # 3. Lenient, non-Dynare fallback for navigation only: next to the
+    #    including file.
+    if working_dir is not None and not strict:
+        hit = _hit(including_dir / candidate_rel)
+        if hit is not None:
+            return hit
 
     # Virtual in-memory workspaces (notably MCP callers) may provide a
     # bare ``helper.mod`` file alongside a nested active file such as
@@ -228,6 +259,9 @@ def trace_include_path(
     including_file_uri_or_path: str,
     search_paths: Optional[List[Path]] = None,
     known_paths: Optional[set] = None,
+    *,
+    working_dir: Optional[Path] = None,
+    strict: bool = False,
 ) -> Dict[str, Any]:
     """Explain how :func:`resolve_include_path` searched for one include.
 
@@ -245,6 +279,8 @@ def trace_include_path(
         including_file_uri_or_path,
         search_paths,
         known_paths=known,
+        working_dir=working_dir,
+        strict=strict,
     )
     attempts: List[Dict[str, Any]] = []
 
@@ -284,12 +320,27 @@ def trace_include_path(
             if including_path.is_file() or including_path.suffix
             else including_path
         )
-        _add("sibling", including_dir / candidate_rel)
+        separate_working_dir = working_dir is not None and not _paths_equal(
+            working_dir, including_dir
+        )
+        if separate_working_dir:
+            assert working_dir is not None
+            _add("working_directory", working_dir / candidate_rel)
+        else:
+            _add("sibling", including_dir / candidate_rel)
         for index, search_path in enumerate(search_paths or []):
+            if working_dir is not None and not search_path.is_absolute():
+                search_path = working_dir / search_path
             _add(
                 "search_path",
                 search_path / candidate_rel,
                 detail=f"search_paths[{index}]",
+            )
+        if separate_working_dir and not strict:
+            _add(
+                "sibling",
+                including_dir / candidate_rel,
+                detail="lenient navigation fallback; Dynare does not search here",
             )
         _add("virtual_relative", candidate_rel)
 

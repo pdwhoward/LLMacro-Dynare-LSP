@@ -38,17 +38,21 @@ from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, cast
 
 from .parser import ParsedModel
 from .steady_state import (
+    DYNARE_SOLVE_TOLF,
     _build_eval_env,
     evaluate_steady_state_model_assignments,
     _escape_expr,
     _escape_reserved,
     _exogenous_values,
+    _normalize_numeric_expr,
     _logncdf,
     _LOCAL_VAR_DEF,
     _norminv,
     _prepare_ss_expression,
     _safe_eval_expr,
     _split_equation,
+    _steady_command_uses_nocheck,
+    _unique_endogenous_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -106,6 +110,14 @@ class SolverResult:
     # convergence -- distinct from a genuine non-convergence failure, so callers
     # can treat it as "inconclusive" rather than "no steady state exists".
     timed_out: bool = False
+    # Informational notes about an accepted solution, e.g. that the residual
+    # Jacobian is rank deficient so the steady state is not locally unique.
+    # Dynare accepts any point whose residual is within solve_tolf and never
+    # checks rank, so such a note never turns success into failure.
+    notes: List[str] = field(default_factory=list)
+    # False when the accepted steady state is known not to be locally unique
+    # (rank-deficient residual Jacobian); None when uniqueness was not checked.
+    locally_unique: Optional[bool] = None
 
 
 def _past_deadline(deadline: Optional[float]) -> bool:
@@ -148,6 +160,17 @@ except ValueError:
     _SYMBOLIC_MAX_VARS = 30
 
 
+# Share of the remaining time budget the symbolic (sympy) stage may use.  A
+# single sympy.solve can run for tens of seconds on a 3-variable RBC model, so
+# the stage is hard-bounded (see symbolic.call_with_hard_deadline) and the rest
+# of the budget is reserved for the numeric cascade.
+_SYMBOLIC_BUDGET_SHARE = 0.4
+# Absolute cap (seconds) on the symbolic stage of a *budgeted* solve: models
+# whose closed form sympy finds do so in well under a second, so anything
+# slower is better left to the numeric cascade.
+_SYMBOLIC_MAX_SECONDS = 1.5
+
+
 class _SkipSymbolicReduction(Exception):
     """Internal sentinel: skip symbolic reduction (size or deadline guard)."""
 
@@ -184,12 +207,17 @@ def _deadline_guarded(fn, deadline):
 # Solver-safe math environment
 # ---------------------------------------------------------------------------
 
-def _dynare_round(value: float) -> int:
-    """Round midpoint values away from zero, matching Dynare semantics."""
+def _dynare_round(value: float) -> float:
+    """Round midpoint values away from zero, matching Dynare semantics.
+
+    Returns a double (as Dynare does) so later ``**`` stays float math.
+    """
     numeric = float(value)
+    if not math.isfinite(numeric):
+        return numeric
     if numeric >= 0:
-        return math.floor(numeric + 0.5)
-    return math.ceil(numeric - 0.5)
+        return float(math.floor(numeric + 0.5))
+    return float(math.ceil(numeric - 0.5))
 
 
 def _build_solver_env(values: Dict[str, float]) -> dict:
@@ -253,8 +281,8 @@ def _build_solver_env(values: Dict[str, float]) -> dict:
         "asinh": math.asinh,
         "acosh": math.acosh,
         "atanh": math.atanh,
-        "floor": math.floor,
-        "ceil": math.ceil,
+        "floor": lambda x: float(math.floor(x)),
+        "ceil": lambda x: float(math.ceil(x)),
         "round": _dynare_round,
         "min": min,
         "max": max,
@@ -413,8 +441,8 @@ def _preprocess_model(
                 name = match.group(1)
                 if name in declared_names:
                     continue
-                expr_str = _escape_expr(
-                    _prepare_ss_expression(match.group(2).strip()))
+                expr_str = _normalize_numeric_expr(_escape_expr(
+                    _prepare_ss_expression(match.group(2).strip())))
                 if not _validate_ast(expr_str):
                     logger.debug(
                         "Rejected unsafe local-var expression: %s", expr_str)
@@ -439,6 +467,9 @@ def _preprocess_model(
             lhs_str, rhs_str = _split_equation(ss_text)
         except ValueError:
             lhs_str, rhs_str = ss_text, None
+        lhs_str = _normalize_numeric_expr(lhs_str)
+        if rhs_str is not None:
+            rhs_str = _normalize_numeric_expr(rhs_str)
 
         if not _validate_ast(lhs_str):
             logger.debug("Rejected unsafe LHS expression: %s", lhs_str)
@@ -732,7 +763,9 @@ def _detect_invalid_domain(
                 # Evaluate the argument in a guarded environment.
                 try:
                     safe_env = _build_eval_env(env)
-                    arg_expr = _escape_expr(arg_ss.replace("^", "**"))
+                    arg_expr = _normalize_numeric_expr(
+                        _escape_expr(arg_ss.replace("^", "**")),
+                    )
                     if not _validate_ast(arg_expr):
                         continue
                     arg_value = eval(  # noqa: S307 — AST-validated, controlled env
@@ -755,7 +788,9 @@ def _detect_invalid_domain(
             )
             try:
                 safe_env = _build_eval_env(env)
-                denom_expr = _escape_expr(denominator_ss.replace("^", "**"))
+                denom_expr = _normalize_numeric_expr(
+                    _escape_expr(denominator_ss.replace("^", "**")),
+                )
                 if not _validate_ast(denom_expr):
                     continue
                 value = eval(  # noqa: S307 - AST-validated, controlled env
@@ -969,8 +1004,13 @@ def _build_initial_guess(
     var_names: List[str],
     param_values: Dict[str, float],
     warm_start_guess: Optional[Dict[str, float]] = None,
+    dynare_defaults: bool = False,
 ) -> "numpy.ndarray":
     """Construct initial guess vector from available information.
+
+    ``dynare_defaults=True`` reproduces Dynare's own starting point: variables
+    without an explicit value start at 0 (``oo_.steady_state`` is zero-filled)
+    instead of the solver's name-based heuristics.
 
     Layers (later overrides earlier):
       1. Default: all ones plus heuristics for common variable name patterns
@@ -982,10 +1022,12 @@ def _build_initial_guess(
     import numpy as np
 
     n = len(var_names)
-    x0 = np.ones(n)
+    x0 = np.zeros(n) if dynare_defaults else np.ones(n)
 
     # Layer 1: Heuristics for common variable types
     for i, name in enumerate(var_names):
+        if dynare_defaults:
+            break
         name_lower = name.lower()
         if name_lower.startswith("log_") or name_lower.startswith("ln_"):
             x0[i] = 0.0
@@ -1434,7 +1476,12 @@ def _try_homotopy(
     import numpy as np
     from scipy.optimize import least_squares
 
-    f0 = residual_fn(x0)
+    try:
+        f0 = residual_fn(x0)
+    except _SolveDeadlineExceeded:
+        return None
+    except Exception:
+        return None
     if not np.all(np.isfinite(f0)):
         return None
 
@@ -1894,6 +1941,48 @@ def _jacobian_rank_issue(
     return None
 
 
+def _non_uniqueness_note(rank_issue: Optional[str]) -> List[str]:
+    """Turn a rank-deficiency finding into an informational note."""
+    if not rank_issue:
+        return []
+    return [
+        f"{rank_issue[0].upper()}{rank_issue[1:]}. The steady state is not "
+        "locally unique; like Dynare (which accepts any point whose residual "
+        "is within solve_tolf and never checks rank), the solver keeps this "
+        "point, but another point of the continuum may be equally valid."
+    ]
+
+
+def _complete_steady_state_model_values(
+    model: ParsedModel,
+    var_names: List[str],
+) -> Optional[Dict[str, float]]:
+    """Values for *every* endogenous variable from ``steady_state_model``.
+
+    Returns ``None`` when there is no block or any variable is unassigned or
+    could not be evaluated (e.g. an external MATLAB helper), in which case
+    the block is only a source of initial guesses.
+    """
+    if not model.steady_state_equations:
+        return None
+    try:
+        _values, assignments = evaluate_steady_state_model_assignments(model)
+    except Exception:
+        return None
+    found: Dict[str, float] = {}
+    wanted = set(var_names)
+    for assignment in assignments:
+        if assignment.name not in wanted:
+            continue
+        if assignment.value is None or not math.isfinite(assignment.value):
+            found.pop(assignment.name, None)
+            continue
+        found[assignment.name] = float(assignment.value)
+    if not wanted.issubset(found):
+        return None
+    return {name: found[name] for name in var_names}
+
+
 _TIMED_BUILTIN_CONSTANT_RE = re.compile(
     r"\b(pi|inf|nan)\s*\(\s*[+-]?\s*\d+\s*\)",
     re.IGNORECASE,
@@ -1989,6 +2078,183 @@ def _model_local_shadowing_names(model: ParsedModel) -> List[str]:
     return names
 
 
+def _local_uniqueness(
+    rank_issue: Optional[str],
+    rank_checked: bool,
+) -> Optional[bool]:
+    if rank_issue is not None:
+        return False
+    return True if rank_checked else None
+
+
+def _accept_steady_state_model(
+    model: ParsedModel,
+    var_names: List[str],
+    ssm_values: Dict[str, float],
+    eval_params: Dict[str, float],
+    exogenous: set,
+    exogenous_values: Dict[str, float],
+    deadline: Optional[float],
+) -> Optional[SolverResult]:
+    """Dynare-faithful verdict on a complete ``steady_state_model`` block.
+
+    Returns a success when the block's values solve the static model within
+    solve_tolf, a failure (Dynare info=19) when they do not, and ``None``
+    when the residual cannot be evaluated here (so the regular cascade runs
+    and the block stays an initial guess).
+    """
+    import numpy as np
+
+    try:
+        residual_fn = _build_residual_function(
+            model, var_names, eval_params, exogenous, exogenous_values,
+            penalize_invalid=False,
+        )
+        x = np.asarray([ssm_values[name] for name in var_names], dtype=float)
+        residuals = np.asarray(residual_fn(x), dtype=float)
+    except Exception:
+        return None
+    if residuals.size == 0 or not np.all(np.isfinite(residuals)):
+        return None
+    residual_max = float(np.max(np.abs(residuals)))
+    domain_issue = _detect_var_log_domain(model, ssm_values)
+    if domain_issue is None:
+        domain_issue = _detect_invalid_domain(
+            model.steady_state_check_equations(), var_names, ssm_values,
+            eval_params, exogenous, exogenous_values,
+        )
+    if domain_issue is not None:
+        return None
+    if residual_max > DYNARE_SOLVE_TOLF and not _steady_command_uses_nocheck(model):
+        return SolverResult(
+            success=False,
+            values=dict(ssm_values),
+            residual_norm=residual_max,
+            method_used="steady_state_model",
+            iterations=0,
+            message=(
+                "The steady_state_model block does not solve the static "
+                f"model: max residual {residual_max:.3e} exceeds Dynare's "
+                f"solve_tolf ({DYNARE_SOLVE_TOLF:.3g}). Dynare stops with "
+                "'The steadystate file did not compute the steady state' "
+                "(info=19) instead of searching for another solution."
+            ),
+            equation_residuals=residuals.tolist(),
+            initial_guess=dict(ssm_values),
+        )
+    # The rank check (informational only) needs O(n) residual evaluations;
+    # use the compiled residual when it covers every equation.
+    rank_fn: Callable = residual_fn
+    try:
+        equations, locals_list = _preprocess_model(model, var_names)
+        if len(equations) == len(model.static_model_equations()):
+            rank_fn = _build_solver_residual_fn(
+                equations, locals_list, var_names, eval_params,
+                exogenous, exogenous_values,
+            )
+    except Exception:
+        rank_fn = residual_fn
+    rank_issue = _jacobian_rank_issue(
+        rank_fn, x, len(var_names), 1e-8, deadline,
+    )
+    rank_checked = rank_issue is not None or not _past_deadline(deadline)
+    notes = _non_uniqueness_note(rank_issue)
+    if residual_max > DYNARE_SOLVE_TOLF:
+        message = (
+            "Steady state taken from the steady_state_model block without "
+            f"checking it (steady(nocheck)); static residual {residual_max:.2e}."
+        )
+    else:
+        message = (
+            "Steady state taken from the steady_state_model block (static "
+            f"residual {residual_max:.2e} <= solve_tolf)."
+        )
+    if notes:
+        message += " Note: " + notes[0]
+    return SolverResult(
+        success=True,
+        values=dict(ssm_values),
+        residual_norm=residual_max,
+        method_used="steady_state_model",
+        iterations=0,
+        message=message,
+        equation_residuals=residuals.tolist(),
+        initial_guess=dict(ssm_values),
+        notes=notes,
+        locally_unique=_local_uniqueness(rank_issue, rank_checked),
+    )
+
+
+def _accept_initial_point(
+    model: ParsedModel,
+    var_names: List[str],
+    x0: "numpy.ndarray",
+    eval_params: Dict[str, float],
+    exogenous: set,
+    exogenous_values: Dict[str, float],
+    validation_residual_fn: Callable,
+    fast_residual_fn: Callable,
+    tolerance: float,
+    deadline: Optional[float],
+    initial_guess_dict: Dict[str, float],
+    symbolic_steps: List[str],
+    n_symbolic: int,
+    n_numerical: int,
+) -> Optional[SolverResult]:
+    """Accept the starting values when they already solve the static model.
+
+    Mirrors dynare_solve's early return (max|residual| < solve_tolf).
+    """
+    import numpy as np
+
+    try:
+        residuals = np.asarray(validation_residual_fn(x0), dtype=float)
+    except Exception:
+        return None
+    if residuals.size == 0 or not np.all(np.isfinite(residuals)):
+        return None
+    residual_max = float(np.max(np.abs(residuals)))
+    if not residual_max < DYNARE_SOLVE_TOLF:
+        return None
+    values = {name: float(x0[i]) for i, name in enumerate(var_names)}
+    domain_issue = _detect_var_log_domain(model, values)
+    if domain_issue is None:
+        domain_issue = _detect_invalid_domain(
+            model.steady_state_check_equations(), var_names, values,
+            eval_params, exogenous, exogenous_values,
+        )
+    if domain_issue is not None:
+        return None
+    rank_issue = _jacobian_rank_issue(
+        fast_residual_fn, np.asarray(x0, dtype=float), len(var_names),
+        tolerance, deadline,
+    )
+    rank_checked = rank_issue is not None or not _past_deadline(deadline)
+    notes = _non_uniqueness_note(rank_issue)
+    message = (
+        "The initial values already solve the static model "
+        f"(max residual {residual_max:.2e} < solve_tolf), as Dynare's "
+        "solver would accept them."
+    )
+    if notes:
+        message += " Note: " + notes[0]
+    return SolverResult(
+        success=True,
+        values=values,
+        residual_norm=residual_max,
+        method_used="initial values",
+        iterations=0,
+        message=message,
+        equation_residuals=residuals.tolist(),
+        initial_guess=initial_guess_dict,
+        symbolic_steps=symbolic_steps,
+        n_symbolic=n_symbolic,
+        n_numerical=n_numerical,
+        notes=notes,
+        locally_unique=_local_uniqueness(rank_issue, rank_checked),
+    )
+
+
 def compute_steady_state(
     model: ParsedModel,
     tolerance: float = 1e-8,
@@ -2016,6 +2282,7 @@ def compute_steady_state(
         if time_budget is not None and time_budget > 0
         else None
     )
+    model = _unique_endogenous_model(model)
     try:
         import numpy as np
         from scipy.optimize import root as _  # noqa: F401
@@ -2118,6 +2385,23 @@ def compute_steady_state(
     eval_params = dict(params)
     eval_params.update(helper_values)
 
+    # ------------------------------------------------------------------
+    # Step -1: a complete steady_state_model block is authoritative.
+    # ------------------------------------------------------------------
+    # Dynare (evaluate_steady_state_file.m) evaluates the block and accepts it
+    # when max|static residual| <= solve_tolf, without running a solver or
+    # checking the Jacobian rank; a larger residual is an error (info=19),
+    # not a starting point for a different solution.
+    if not model.policy_commands:
+        ssm_values = _complete_steady_state_model_values(model, var_names)
+        if ssm_values is not None:
+            ssm_result = _accept_steady_state_model(
+                model, var_names, ssm_values, eval_params,
+                exogenous, exogenous_values, deadline,
+            )
+            if ssm_result is not None:
+                return ssm_result
+
     symbolic_steps: List[str] = []
     symbolic_solved_count = 0
     preferred_symbolic_values = _preferred_symbolic_values(
@@ -2134,11 +2418,17 @@ def compute_steady_state(
             raise _SkipSymbolicReduction
         from .symbolic import reduce_symbolically
 
+        symbolic_deadline = None
+        if deadline is not None:
+            remaining = max(0.0, deadline - time.monotonic())
+            symbolic_deadline = time.monotonic() + min(
+                remaining * _SYMBOLIC_BUDGET_SHARE, _SYMBOLIC_MAX_SECONDS,
+            )
         symbolic_result = reduce_symbolically(
             model,
             eval_params,
             preferred_values=preferred_symbolic_values,
-            deadline=deadline,
+            deadline=symbolic_deadline,
         )
         symbolic_steps = list(symbolic_result.symbolic_steps)
         symbolic_solved_count = len(set(var_names) & set(symbolic_result.solved_values))
@@ -2243,6 +2533,32 @@ def compute_steady_state(
                           for i, name in enumerate(var_names)}
 
     # ------------------------------------------------------------------
+    # Step 1b: the starting point may already be a steady state.
+    # ------------------------------------------------------------------
+    # dynare_solve returns the initial values unchanged when
+    # max|residual| < solve_tolf (errorcode -11), e.g. an initval block that
+    # already solves the static model -- including a point on a continuum of
+    # steady states, which Dynare keeps as is.
+    # Try Dynare's exact starting point first (unset variables at 0), so a
+    # point on a continuum of steady states coincides with Dynare's.
+    x_dynare = _build_initial_guess(
+        model, var_names, params, warm_start_guess, dynare_defaults=True,
+    )
+    if user_initial_guess:
+        for name, val in user_initial_guess.items():
+            if name in var_names:
+                x_dynare[var_names.index(name)] = val
+    for x_candidate in (x_dynare, x0):
+        initial_result = _accept_initial_point(
+            model, var_names, x_candidate, eval_params, exogenous,
+            exogenous_values, validation_residual_fn, _raw_solver_residual_fn,
+            tolerance, deadline, initial_guess_dict, symbolic_steps,
+            symbolic_solved_count, symbolic_numerical_count,
+        )
+        if initial_result is not None:
+            return initial_result
+
+    # ------------------------------------------------------------------
     # Step 2: Gauss-Seidel pre-conditioning
     # ------------------------------------------------------------------
     x_gs = _gauss_seidel_improve(
@@ -2279,6 +2595,7 @@ def compute_steady_state(
             tolerance,
             deadline,
         )
+        rank_checked = rank_issue is not None or not _past_deadline(deadline)
         if (
             domain_issue is None
             and (not np.isfinite(validation_max)
@@ -2300,55 +2617,26 @@ def compute_steady_state(
                 n_symbolic=symbolic_solved_count,
                 n_numerical=symbolic_numerical_count,
             )
-        if domain_issue is None and rank_issue is None:
-            # If the rank check was skipped because the deadline elapsed, we
-            # cannot confirm the system is full-rank: return an inconclusive
-            # timed-out result rather than a false success.
-            if _past_deadline(deadline):
-                return SolverResult(
-                    success=False, values=values,
-                    residual_norm=validation_max,
-                    method_used="Gauss-Seidel",
-                    iterations=0,
-                    message=(
-                        "Converged using Gauss-Seidel but rank check was skipped "
-                        "(time budget elapsed); result is inconclusive."
-                    ),
-                    equation_residuals=validation_residuals.tolist(),
-                    initial_guess=initial_guess_dict,
-                    symbolic_steps=symbolic_steps,
-                    n_symbolic=symbolic_solved_count,
-                    n_numerical=symbolic_numerical_count,
-                    timed_out=True,
-                )
+        if domain_issue is None:
+            # Rank deficiency is informational only (Dynare never checks it);
+            # a rank check skipped for lack of budget leaves uniqueness unknown.
+            notes = _non_uniqueness_note(rank_issue)
+            message = "Converged using Gauss-Seidel pre-conditioning alone."
+            if notes:
+                message += " Note: " + notes[0]
             return SolverResult(
                 success=True, values=values,
                 residual_norm=validation_max,
                 method_used="Gauss-Seidel",
                 iterations=0,
-                message="Converged using Gauss-Seidel pre-conditioning alone.",
+                message=message,
                 equation_residuals=validation_residuals.tolist(),
                 initial_guess=initial_guess_dict,
                 symbolic_steps=symbolic_steps,
                 n_symbolic=symbolic_solved_count,
                 n_numerical=symbolic_numerical_count,
-            )
-        if domain_issue is None and rank_issue is not None:
-            return SolverResult(
-                success=False,
-                values=values,
-                residual_norm=gs_max,
-                method_used="Gauss-Seidel",
-                iterations=0,
-                message=(
-                    "Converged using Gauss-Seidel but rejected: "
-                    f"{rank_issue}."
-                ),
-                equation_residuals=gs_residuals.tolist(),
-                initial_guess=initial_guess_dict,
-                symbolic_steps=symbolic_steps,
-                n_symbolic=symbolic_solved_count,
-                n_numerical=symbolic_numerical_count,
+                notes=notes,
+                locally_unique=_local_uniqueness(rank_issue, rank_checked),
             )
         # Otherwise fall through and let the downstream solvers try.
         logger.info("Gauss-Seidel solution rejected: %s", domain_issue)
@@ -2416,49 +2704,25 @@ def compute_steady_state(
             tolerance,
             deadline,
         )
-        if rank_issue is not None:
-            return SolverResult(
-                success=False, values=vals,
-                residual_norm=float(np.max(np.abs(r))),
-                method_used=method_name, iterations=niter,
-                message=(
-                    f"Converged using {method_name} but rejected: "
-                    f"{rank_issue}."
-                ),
-                equation_residuals=r.tolist(),
-                initial_guess=initial_guess_dict,
-                symbolic_steps=symbolic_steps,
-                n_symbolic=symbolic_solved_count,
-                n_numerical=symbolic_numerical_count,
-            )
-        # If rank_issue is None because the deadline elapsed (not because the
-        # system is genuinely full-rank), treat the result as inconclusive.
-        if _past_deadline(deadline):
-            return SolverResult(
-                success=False, values=vals,
-                residual_norm=float(np.max(np.abs(r))),
-                method_used=method_name, iterations=niter,
-                message=(
-                    f"Converged using {method_name} but rank check was skipped "
-                    "(time budget elapsed); result is inconclusive."
-                ),
-                equation_residuals=r.tolist(),
-                initial_guess=initial_guess_dict,
-                symbolic_steps=symbolic_steps,
-                n_symbolic=symbolic_solved_count,
-                n_numerical=symbolic_numerical_count,
-                timed_out=True,
-            )
+        rank_checked = rank_issue is not None or not _past_deadline(deadline)
+        # Rank deficiency does not reject a converged point: Dynare accepts
+        # whatever its solver returns within solve_tolf.  Report it instead.
+        notes = _non_uniqueness_note(rank_issue)
+        message = f"Converged using {method_name}.{extra_msg}"
+        if notes:
+            message += " Note: " + notes[0]
         return SolverResult(
             success=True, values=vals,
             residual_norm=float(np.max(np.abs(r))),
             method_used=method_name, iterations=niter,
-            message=f"Converged using {method_name}.{extra_msg}",
+            message=message,
             equation_residuals=r.tolist(),
             initial_guess=initial_guess_dict,
             symbolic_steps=symbolic_steps,
             n_symbolic=symbolic_solved_count,
             n_numerical=symbolic_numerical_count,
+            notes=notes,
+            locally_unique=_local_uniqueness(rank_issue, rank_checked),
         )
 
     # ------------------------------------------------------------------

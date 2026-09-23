@@ -101,16 +101,26 @@ def install(core) -> None:
             prior.cancel()
 
         def run_if_current() -> None:
-            with core._state_lock:
-                if core._validation_tokens.get(uri, 0) != token:
+            # The installed guard checks both token and live source inside the
+            # same-document lifecycle gate, then commits without an edit race.
+            guarded_validate = getattr(core, "_validate_scheduled_document", None)
+            if guarded_validate is not None:
+                if not guarded_validate(uri, text, token):
                     return
-            try:
-                current = core.server.workspace.get_text_document(uri).source
-            except Exception:
-                return
-            if current != text:
-                return
-            core._validate_document(uri, text)
+            else:
+                # Keep this extension independently testable and usable if a
+                # downstream embedder installs only the diagnostic tiers.
+                with core._state_lock:
+                    if core._validation_tokens.get(uri, 0) != token:
+                        return
+                try:
+                    current = core.server.workspace.get_text_document(uri).source
+                except Exception:
+                    return
+                if current != text:
+                    return
+                core._validate_document(uri, text)
+            # Never hold a document gate across dependent-document validation.
             core._schedule_solve(uri)
             core._revalidate_cached_documents(schedule_solve=True, exclude_uri=uri)
 

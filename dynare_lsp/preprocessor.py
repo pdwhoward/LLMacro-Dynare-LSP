@@ -86,6 +86,35 @@ def _bundled_preprocessor() -> Optional[str]:
     return None
 
 
+def _install_version_key(name: str) -> Tuple[Tuple[int, ...], int, str]:
+    """Sort key for Dynare install folders such as ``6.10-arm64`` or ``7.1``.
+
+    Numeric version components compare numerically (6.10 > 6.9); a folder
+    whose architecture suffix matches this machine wins a version tie.
+    """
+    match = re.match(r"(\d+(?:\.\d+)*)", name)
+    version = tuple(int(part) for part in match.group(1).split(".")) if match else ()
+    machine = platform.machine().lower()
+    arch_aliases = {"arm64", "aarch64"} if machine in {"arm64", "aarch64"} else {machine}
+    suffix = name[match.end():].lower() if match else name.lower()
+    arch_match = int(any(alias and alias in suffix for alias in arch_aliases))
+    return version, arch_match, name
+
+
+def dynare_versioned_install_roots(parent: str) -> List[str]:
+    """Return ``parent/<version>`` install directories, newest first."""
+    try:
+        entries = [
+            entry
+            for entry in os.listdir(parent)
+            if os.path.isdir(os.path.join(parent, entry))
+        ]
+    except OSError:
+        return []
+    entries.sort(key=_install_version_key, reverse=True)
+    return [os.path.join(parent, entry) for entry in entries]
+
+
 def find_preprocessor(configured_path: Optional[str] = None) -> Optional[str]:
     """Find the dynare-preprocessor binary.
 
@@ -126,30 +155,27 @@ def find_preprocessor(configured_path: Optional[str] = None) -> Optional[str]:
     if system == "Windows":
         # Dynare installs under C:\Program Files\dynare\X.Y or C:\dynare\X.Y
         for dynare_root in ("C:\\Program Files\\dynare", "C:\\dynare"):
-            if not os.path.isdir(dynare_root):
-                continue
-            try:
-                for entry in sorted(os.listdir(dynare_root), reverse=True):
-                    candidates.append(
-                        os.path.join(
-                            dynare_root,
-                            entry,
-                            "preprocessor",
-                            "dynare-preprocessor.exe",
-                        )
-                    )
-            except OSError:
-                pass
+            for root in dynare_versioned_install_roots(dynare_root):
+                candidates.append(
+                    os.path.join(root, "preprocessor", "dynare-preprocessor.exe")
+                )
 
     elif system == "Linux":
         candidates.extend(
             [
                 "/usr/lib/dynare/preprocessor/dynare-preprocessor",
+                "/usr/lib64/dynare/preprocessor/dynare-preprocessor",
                 "/usr/local/lib/dynare/preprocessor/dynare-preprocessor",
             ]
         )
 
     elif system == "Darwin":
+        # The macOS package installs to /Applications/Dynare/<x.y-arch>/;
+        # several versions can coexist, so probe the newest first.
+        candidates.extend(
+            os.path.join(root, "preprocessor", "dynare-preprocessor")
+            for root in dynare_versioned_install_roots("/Applications/Dynare")
+        )
         candidates.extend(
             [
                 "/Applications/Dynare/preprocessor/dynare-preprocessor",
@@ -416,95 +442,119 @@ def _active_include_paths(mod_text: str) -> List[str]:
     return [include.filename for include in _parse_includes(macro_scan)]
 
 
-def _requires_source_dir_file(mod_text: str) -> bool:
-    """Whether Dynare needs the synthetic model beside source-relative includes."""
-    if any(
-        not _is_absolute_macro_path(include_path)
-        for include_path in _active_include_paths(mod_text)
-    ):
-        return True
+def _unquote_macro_path(raw_path: str) -> str:
+    path = raw_path.strip()
+    if len(path) >= 2 and path[0] == path[-1] and path[0] in {"'", '"'}:
+        path = path[1:-1].strip()
+    return path
+
+
+def dynare_include_candidates(
+    include_path: str,
+    working_dir: Optional[str],
+    search_dirs: List[str],
+) -> List[str]:
+    """Files Dynare tries for one ``@#include``, in Dynare's order.
+
+    Mirrors ``macro/Directives.cc`` (Dynare 7.1): the literal filename is
+    opened relative to the process working directory (the entry model's
+    folder, because ``dynare.m`` runs the preprocessor there), then
+    ``dir / filename`` for every ``-I`` / ``@#includepath`` directory in
+    declaration order.  Dynare never looks next to the *including* file.
+    Relative search directories are themselves relative to the working
+    directory.
+    """
+    if os.path.isabs(include_path):
+        return [include_path]
+    candidates: List[str] = []
+    if working_dir is not None:
+        candidates.append(os.path.join(working_dir, include_path))
+    for directory in search_dirs:
+        if not os.path.isabs(directory):
+            if working_dir is None:
+                continue
+            directory = os.path.join(working_dir, directory)
+        candidates.append(os.path.join(directory, include_path))
+    return candidates
+
+
+def _active_includepath_arguments(mod_text: str) -> List[str]:
     macro_scan = _strip_non_macro_comments(mod_text)
     _defines, active_lines, _line_defines = _macro_branch_state(macro_scan)
     macro_scan = _mask_inactive_macro_lines(macro_scan, active_lines)
-    for directive in _parse_macro_directives(macro_scan):
-        if directive.kind != "includepath" or directive.argument is None:
-            continue
-        parts = _split_includepath_argument(directive.argument)
-        if not parts or any(not _is_absolute_macro_path(part) for part in parts):
-            return True
-    return False
+    return [
+        directive.argument or ""
+        for directive in _parse_macro_directives(macro_scan)
+        if directive.kind == "includepath"
+    ]
 
 
-def _include_search_directories(
-    mod_text: str,
-    source_dir: Optional[str],
-) -> List[str]:
-    """Collect include-file directories needed by nested relative includes.
+_ANY_INCLUDE_DIRECTIVE_RE = re.compile(
+    r"^[ \t]*@#[ \t]*include(?![A-Za-z0-9_])",
+    re.IGNORECASE | re.MULTILINE,
+)
 
-    Dynare resolves every relative ``@#include`` against the process working
-    directory and its ``-I`` search list, not against the directory of the
-    file containing that directive. Add each statically-resolvable included
-    file's parent directory so an absolute (or subdirectory-relative) include
-    can itself include a sibling file.
+
+def _has_unparsed_include(mod_text: str) -> bool:
+    """Whether an active ``@#include`` names its file with a macro expression.
+
+    ``_parse_includes`` only reports literal quoted filenames; ``@#include
+    FILE`` or ``@#include "a" + B`` can name any file, possibly relative.
     """
-    directories: List[str] = []
-    seen_directories: set[str] = set()
-    seen_files: set[str] = set()
+    macro_scan = _strip_non_macro_comments(mod_text)
+    _defines, active_lines, _line_defines = _macro_branch_state(macro_scan)
+    macro_scan = _mask_inactive_macro_lines(macro_scan, active_lines)
+    return len(_ANY_INCLUDE_DIRECTIVE_RE.findall(macro_scan)) > len(
+        _parse_includes(macro_scan)
+    )
 
-    def _add_directory(path: str) -> None:
-        absolute = os.path.abspath(path)
-        key = os.path.normcase(absolute)
-        if key not in seen_directories:
-            seen_directories.add(key)
-            directories.append(absolute)
 
-    def _walk(content: str, base_dir: Optional[str]) -> None:
+def _requires_source_dir_file(mod_text: str) -> bool:
+    """Whether Dynare needs the synthetic model in the real working directory.
+
+    Dynare resolves every relative ``@#include`` / ``@#includepath`` —
+    including those inside transitively included files — against its working
+    directory, which for a real run is the model's folder.  The model can run
+    from an isolated temp directory only when every statically reachable
+    include and include path is absolute; anything relative or dynamic
+    (macro-built) needs ``cwd = source_dir``.
+    """
+    seen: set[str] = set()
+
+    def _needs_source_dir(content: str) -> bool:
+        if _has_unparsed_include(content):
+            return True
+        for argument in _active_includepath_arguments(content):
+            parts = _split_includepath_argument(argument)
+            if not parts or any(not _is_absolute_macro_path(part) for part in parts):
+                return True
         for raw_path in _active_include_paths(content):
-            include_path = raw_path.strip()
-            if (
-                len(include_path) >= 2
-                and include_path[0] == include_path[-1]
-                and include_path[0] in {"'", '"'}
-            ):
-                include_path = include_path[1:-1].strip()
-            if not include_path or "@{" in include_path:
+            if not _is_absolute_macro_path(raw_path):
+                return True
+            include_path = _unquote_macro_path(raw_path)
+            # A Windows path is not traversable on POSIX (and vice versa).
+            if not os.path.isabs(include_path) or not os.path.isfile(include_path):
                 continue
-
-            if _is_absolute_macro_path(include_path):
-                # A Windows path is not traversable on POSIX (and vice versa),
-                # even though PureWindowsPath can still recognize its syntax.
-                if not os.path.isabs(include_path):
-                    continue
-                candidate = os.path.abspath(include_path)
-            elif base_dir is not None:
-                candidate = os.path.abspath(os.path.join(base_dir, include_path))
-            else:
+            key = os.path.normcase(os.path.abspath(include_path))
+            if key in seen:
                 continue
-
-            if not os.path.isfile(candidate):
-                continue
-            parent = os.path.dirname(candidate)
-            _add_directory(parent)
-
-            file_key = os.path.normcase(candidate)
-            if file_key in seen_files:
-                continue
-            seen_files.add(file_key)
+            seen.add(key)
             try:
                 with open(
-                    candidate,
+                    include_path,
                     "r",
                     encoding="utf-8-sig",
                     errors="replace",
                     newline="",
                 ) as include_file:
-                    nested_content = include_file.read()
+                    nested = include_file.read()
             except OSError:
                 continue
-            _walk(nested_content, parent)
+            if _needs_source_dir(nested):
+                return True
+        return False
 
-    _walk(mod_text, source_dir)
-    return directories
+    return _needs_source_dir(mod_text)
 
 
 def _macro_path_is_synthetic(
@@ -530,11 +580,113 @@ def _macro_path_is_synthetic(
         return False
 
 
+# ``ERROR: message`` without a ``file: line N`` location (checked only after
+# the located and macro-processor forms).  Unlocated warnings stay ignored, as
+# before, so accepted models do not gain new diagnostics.
+_PREPROC_UNLOCATED_LINE = re.compile(r"^(ERROR):\s*(\S.*)$")
+# Cheap anchors for well-known unlocated messages: the symbol or command the
+# message names.  Anything else anchors at the start of the document.
+_UNLOCATED_ANCHORS = (
+    re.compile(r"^(?P<token>[A-Za-z_]\w*) not used in model block"),
+    re.compile(r"\bin (?P<token>histval|endval|initval)\b"),
+)
+
+
+def _locate_unlocated_message(
+    message: str,
+    source_lines: Optional[List[str]],
+) -> SourceRange:
+    """Best-effort source range for a location-less preprocessor message."""
+    default = SourceRange(Position(0, 0), Position(0, 1))
+    if not source_lines:
+        return default
+    token = None
+    for pattern in _UNLOCATED_ANCHORS:
+        match = pattern.search(message)
+        if match is not None:
+            token = match.group("token")
+            break
+    if token is None:
+        return default
+    token_re = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(token)}(?![A-Za-z0-9_])")
+    in_block_comment = False
+    for line_no, line in enumerate(source_lines):
+        code = line
+        if in_block_comment:
+            end = code.find("*/")
+            if end < 0:
+                continue
+            code = " " * (end + 2) + code[end + 2 :]
+            in_block_comment = False
+        start = code.find("/*")
+        if start >= 0 and code.find("*/", start + 2) < 0:
+            code = code[:start]
+            in_block_comment = True
+        for marker in ("//", "%"):
+            cut = code.find(marker)
+            if cut >= 0:
+                code = code[:cut]
+        match = token_re.search(code)
+        if match is not None:
+            return SourceRange(
+                Position(line_no, match.start()), Position(line_no, match.end())
+            )
+    return default
+
+
+def _byte_offset_to_index(line_text: str, byte_offset: int) -> int:
+    """Map a UTF-8 byte offset within *line_text* to a Python string index.
+
+    The Dynare preprocessor (flex/bison and the macro lexer) counts columns
+    in bytes of the UTF-8 source, while diagnostics in this package use
+    Python string indices (the server converts those to the negotiated LSP
+    unit).  An offset inside a multi-byte character rounds up to the next
+    character; offsets past the end clamp to the line length (excluding a
+    trailing CR).
+    """
+    text = line_text[:-1] if line_text.endswith("\r") else line_text
+    if byte_offset <= 0:
+        return 0
+    consumed = 0
+    for index, char in enumerate(text):
+        if consumed >= byte_offset:
+            return index
+        consumed += len(char.encode("utf-8", "surrogatepass"))
+    return len(text)
+
+
+def _byte_range_to_char_range(
+    rng: SourceRange,
+    source_lines: Optional[List[str]],
+) -> SourceRange:
+    """Convert a byte-column range on the synthetic model to string indices."""
+    if source_lines is None:
+        return rng
+
+    def _convert(pos: Position) -> Position:
+        if 0 <= pos.line < len(source_lines):
+            return Position(
+                pos.line, _byte_offset_to_index(source_lines[pos.line], pos.character)
+            )
+        return pos
+
+    start = _convert(rng.start)
+    end = _convert(rng.end)
+    if end.line == start.line and end.character <= start.character:
+        line_text = (
+            source_lines[start.line] if 0 <= start.line < len(source_lines) else ""
+        )
+        line_len = len(line_text[:-1] if line_text.endswith("\r") else line_text)
+        end = Position(end.line, min(start.character + 1, max(line_len, start.character)))
+    return SourceRange(start, end)
+
+
 def _macro_location_to_range(
     loc: "re.Match[str]",
     message: str,
     synthetic_path: Optional[str],
     synthetic_abs: Optional[str],
+    source_lines: Optional[List[str]] = None,
 ) -> Tuple[str, SourceRange]:
     """Convert a backtrace ``"file" line N, col A[-B| to line M, col B]``."""
     line0 = max(int(loc.group(2)) - 1, 0)
@@ -549,8 +701,9 @@ def _macro_location_to_range(
         end_line0 = line0
         end_col0 = col0 + 1
     if _macro_path_is_synthetic(loc.group(1), synthetic_path, synthetic_abs):
-        return message, SourceRange(
-            Position(line0, col0), Position(end_line0, end_col0)
+        return message, _byte_range_to_char_range(
+            SourceRange(Position(line0, col0), Position(end_line0, end_col0)),
+            source_lines,
         )
     label = _diagnostic_file_label(loc.group(1), synthetic_path)
     return (
@@ -563,6 +716,7 @@ def _macro_inline_location_to_range(
     inline: "re.Match[str]",
     synthetic_path: Optional[str],
     synthetic_abs: Optional[str],
+    source_lines: Optional[List[str]] = None,
 ) -> Tuple[str, SourceRange]:
     """Convert ``path:LINE.COL[-COL]: msg`` from ``ERROR in macro-processor``."""
     directive = inline.group(1)
@@ -577,8 +731,11 @@ def _macro_inline_location_to_range(
     if directive:
         message = f"{directive}: {message}"
     if _macro_path_is_synthetic(path, synthetic_path, synthetic_abs):
-        return message, SourceRange(
-            Position(line0, col0), Position(line0, max(end_col0, col0 + 1))
+        return message, _byte_range_to_char_range(
+            SourceRange(
+                Position(line0, col0), Position(line0, max(end_col0, col0 + 1))
+            ),
+            source_lines,
         )
     label = _diagnostic_file_label(path, synthetic_path)
     return (
@@ -590,6 +747,7 @@ def _macro_inline_location_to_range(
 def _parse_preprocessor_output(
     output: str,
     synthetic_path: Optional[str] = None,
+    source_text: Optional[str] = None,
 ) -> List[Diagnostic]:
     """Parse preprocessor stderr into Diagnostic objects.
 
@@ -609,6 +767,10 @@ def _parse_preprocessor_output(
         _os.path.normcase(_os.path.abspath(synthetic_path)) if synthetic_path else None
     )
 
+    # With the synthetic model's text, byte columns on it become string
+    # indices (see ``_byte_offset_to_index``).
+    source_lines = source_text.split("\n") if source_text is not None else None
+
     output_lines = output.splitlines()
     idx = 0
     while idx < len(output_lines):
@@ -619,6 +781,29 @@ def _parse_preprocessor_output(
         if not m:
             macro_m = _PREPROC_MACRO_PROCESSOR_LINE.match(stripped)
             if not macro_m:
+                unlocated = _PREPROC_UNLOCATED_LINE.match(stripped)
+                if unlocated is None:
+                    continue
+                # Semantic checks (unused exogenous under strict mode,
+                # histval(all_values_required), perfect-foresight/stochastic
+                # mixing, planner_objective pairing, ...) print a bare
+                # ``ERROR: message`` with no file/line.  Keep Dynare's exact
+                # message instead of degrading to a generic P000.
+                message = unlocated.group(2).strip()
+                diagnostics.append(
+                    Diagnostic(
+                        range=_locate_unlocated_message(message, source_lines),
+                        severity=(
+                            Severity.ERROR
+                            if unlocated.group(1) == "ERROR"
+                            else Severity.WARNING
+                        ),
+                        message=message,
+                        source="dynare-preprocessor",
+                        code=f"P{code_counter:03d}",
+                    )
+                )
+                code_counter += 1
                 continue
             level = (macro_m.group(1) or "ERROR").upper()
             message = (macro_m.group(2) or macro_m.group(3) or "").strip()
@@ -650,7 +835,7 @@ def _parse_preprocessor_output(
                     inline_bullet = _PREPROC_MACRO_INLINE_LOCATION.match(bullet_text)
                     if inline_bullet is not None:
                         cause, bullet_rng = _macro_inline_location_to_range(
-                            inline_bullet, synthetic_path, synthetic_abs
+                            inline_bullet, synthetic_path, synthetic_abs, source_lines
                         )
                         if inline_rng is None:
                             inline_rng = bullet_rng
@@ -663,7 +848,7 @@ def _parse_preprocessor_output(
                     message = "; ".join(causes)
                 if located is not None:
                     message, rng = _macro_location_to_range(
-                        located, message, synthetic_path, synthetic_abs
+                        located, message, synthetic_path, synthetic_abs, source_lines
                     )
                 elif inline_rng is not None:
                     rng = inline_rng
@@ -671,7 +856,7 @@ def _parse_preprocessor_output(
                 inline = _PREPROC_MACRO_INLINE_LOCATION.match(message)
                 if inline is not None:
                     message, rng = _macro_inline_location_to_range(
-                        inline, synthetic_path, synthetic_abs
+                        inline, synthetic_path, synthetic_abs, source_lines
                     )
             severity = Severity.ERROR if level == "ERROR" else Severity.WARNING
             code = f"P{code_counter:03d}"
@@ -754,9 +939,12 @@ def _parse_preprocessor_output(
                 Position(0, 1),
             )
         else:
-            rng = SourceRange(
-                Position(line_no, col),
-                Position(end_line, end_col),
+            rng = _byte_range_to_char_range(
+                SourceRange(
+                    Position(line_no, col),
+                    Position(end_line, end_col),
+                ),
+                source_lines,
             )
         diagnostics.append(
             Diagnostic(
@@ -801,6 +989,7 @@ def _terminate_process_tree(proc: "subprocess.Popen[str]") -> None:
         try:
             completed = subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
@@ -854,6 +1043,9 @@ def _execute_preprocessor(
         "encoding": "utf-8",
         "errors": "replace",
         "cwd": cwd,
+        # Never inherit the caller's stdin: under the MCP/LSP stdio servers it
+        # is the JSON-RPC channel.
+        "stdin": subprocess.DEVNULL,
     }
 
     # Existing embedders and tests replace subprocess.run to inject a runner.
@@ -876,8 +1068,12 @@ def _execute_preprocessor(
     )
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _terminate_process_tree(proc)
+    except BaseException:
+        # Timeout, KeyboardInterrupt, thread cancellation, ...: never leave
+        # the preprocessor running (it would keep writing into, and locking,
+        # the directory the caller is about to clean up).
+        if proc.poll() is None:
+            _terminate_process_tree(proc)
         _drain_process_after_timeout(proc)
         raise
     return subprocess.CompletedProcess(
@@ -899,12 +1095,65 @@ def _remove_artifact_with_retries(path: str, attempts: int = 4) -> None:
             return
         except FileNotFoundError:
             return
-        except PermissionError:
+        except OSError:
+            # PermissionError (sharing locks) and other transient OSErrors
+            # such as "directory not empty" while a sync client or the
+            # just-killed preprocessor still holds a handle are retried.
             if attempt + 1 == attempts:
                 return
             time.sleep(0.02 * (2**attempt))
-        except OSError:
-            return
+
+
+def _model_argument(model_path: str, cwd: str) -> str:
+    """The model path to hand the preprocessor, relative to *cwd* if needed.
+
+    The bundled Windows preprocessor aborts (0xC0000409) when a path
+    argument contains non-ASCII characters, while a bare filename resolved
+    against a non-ASCII working directory works.  The model always lives in
+    *cwd*, so pass just its basename in that case (as ``dynare.m`` does).
+    """
+    if model_path.isascii():
+        return model_path
+    model_dir = os.path.normcase(os.path.abspath(os.path.dirname(model_path)))
+    if model_dir == os.path.normcase(os.path.abspath(cwd)):
+        return os.path.basename(model_path)
+    try:
+        return os.path.relpath(model_path, cwd)
+    except ValueError:
+        return model_path
+
+
+def _nul_byte_result(
+    mod_text: str,
+    preprocessor_path: str,
+) -> Optional[PreprocessorResult]:
+    """Reject a NUL byte up front: the bundled preprocessor hangs on it."""
+    offset = mod_text.find("\x00")
+    if offset < 0:
+        return None
+    line = mod_text.count("\n", 0, offset)
+    character = offset - (mod_text.rfind("\n", 0, offset) + 1)
+    message = (
+        "NUL character (U+0000) in the model text; Dynare cannot read it "
+        "(the preprocessor was not run)"
+    )
+    return PreprocessorResult(
+        success=False,
+        diagnostics=[
+            Diagnostic(
+                range=SourceRange(
+                    Position(line, character),
+                    Position(line, character + 1),
+                ),
+                severity=Severity.ERROR,
+                message=message,
+                source="dynare-preprocessor",
+                code="P001",
+            )
+        ],
+        raw_output=message,
+        preprocessor_path=preprocessor_path,
+    )
 
 
 def run_preprocessor(
@@ -912,11 +1161,15 @@ def run_preprocessor(
     preprocessor_path: str,
     timeout: int = 30,
     source_dir: Optional[str] = None,
+    *,
+    use_cache: bool = True,
 ) -> PreprocessorResult:
     """Run the Dynare preprocessor on model text.
 
     Writes text to a temp file, runs the preprocessor in check mode,
-    parses output, and cleans up.
+    parses output, and cleans up.  *use_cache* is consumed by the content
+    cache that :mod:`preprocessor_cache` installs around this function; the
+    uncached implementation itself always runs.
 
     *source_dir* is the directory of the actual document being checked,
     if known.  When the model has active source-relative ``@#include`` or
@@ -928,6 +1181,10 @@ def run_preprocessor(
     """
     if mod_text.startswith("\ufeff"):
         mod_text = mod_text[1:]
+
+    nul_result = _nul_byte_result(mod_text, preprocessor_path)
+    if nul_result is not None:
+        return nul_result
 
     tmp_dir = None
     tmp_file = None
@@ -962,14 +1219,17 @@ def run_preprocessor(
         with open(tmp_file, "w", encoding="utf-8", newline="") as f:
             f.write(mod_text)
 
-        include_search_dirs = _include_search_directories(mod_text, source_dir_abs)
+        # No ``-I`` flags: ``dynare.m`` passes none, and Dynare resolves
+        # relative includes only against its working directory (plus
+        # ``@#includepath``), never next to the including file.  Adding the
+        # included files' folders here used to accept models real Dynare
+        # rejects ("Could not open ...").
         cmd = [
             preprocessor_path,
-            tmp_file,
+            _model_argument(tmp_file, run_cwd),
             "json=check",
             "onlyjson",
             "nopreprocessoroutput",
-            *(f"-I{path}" for path in include_search_dirs),
         ]
 
         result = _execute_preprocessor(
@@ -984,6 +1244,7 @@ def run_preprocessor(
         diagnostics = _parse_preprocessor_output(
             raw_output,
             synthetic_path=tmp_file,
+            source_text=mod_text,
         )
         if result.returncode != 0 and not diagnostics:
             output_detail = (

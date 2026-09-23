@@ -10,10 +10,11 @@ whether observed variables receive enough *independent* innovations.
 from __future__ import annotations
 
 from copy import copy
-from typing import Any, Dict, List, cast
+from typing import Dict, List
 
 from .diagnostics import Diagnostic, Severity
 from .parser import ParsedModel, Position, SourceRange
+from .steady_state import _unique_endogenous_model
 
 CODE = "W098"
 
@@ -29,18 +30,23 @@ def _anchor(model: ParsedModel) -> SourceRange:
 def _shock_impact_matrix(model: ParsedModel, ss_values: Dict[str, float]):
     """Return endogenous-by-structural-shock first-order impact matrix."""
     import numpy as np
-    from scipy.linalg import ordqz
 
     from .bk_check import (
+        DYNARE_DEFAULT_QZ_CRITERIUM,
         _compute_jacobian,
         _extract_variable_timing,
         _form_minimal_dynamic_pencil,
         check_blanchard_kahn,
+        dynare_ordered_qz,
+        stable_policy_matrix,
+        user_qz_criterium,
     )
 
+    model = _unique_endogenous_model(model)
     bk = check_blanchard_kahn(model, ss_values)
     if not bk.satisfied:
         raise ValueError("a determinate Blanchard-Kahn solution is required")
+    qz_criterium = user_qz_criterium(model) or DYNARE_DEFAULT_QZ_CRITERIUM
 
     endo_names = [item.name for item in model.endogenous]
     timing = _extract_variable_timing(model)
@@ -62,29 +68,13 @@ def _shock_impact_matrix(model: ParsedModel, ss_values: Dict[str, float]):
         forward_indices,
         static_indices,
     )
-    qz_criterium = 1.000001
-
-    def explosive(alpha, beta):
-        return np.abs(alpha) > qz_criterium * np.abs(beta)
-
-    if a.shape[0]:
-        _aa, _bb, _alpha, _beta, _q, z = cast(Any, ordqz)(
-            a, b, sort=explosive, output="complex"
-        )
-    else:
-        z = np.zeros((0, 0), dtype=complex)
-
+    # Dynare's stable-first ordering (mjdgges); the policy rule on the stable
+    # manifold is y_F(t) = H y_P(t-1) with H = w[F, :n_P] inv(w[P, :n_P]),
+    # identical to dyn_first_order_solver's gx = -Z22 \ Z21.
+    _alpha, _beta, w, _sdim = dynare_ordered_qz(a, b, qz_criterium)
     n_pred = len(predetermined_indices)
     n_forward = len(forward_indices)
-    if n_pred:
-        stable = z[:, n_forward:]
-        z_pred = stable[:n_pred, :]
-        z_forward = stable[n_pred:, :]
-        if z_pred.shape != (n_pred, n_pred) or np.linalg.matrix_rank(z_pred) < n_pred:
-            raise ValueError("stable invariant subspace is rank deficient")
-        h_forward = z_forward @ np.linalg.inv(z_pred)
-    else:
-        h_forward = np.zeros((n_forward, 0), dtype=complex)
+    h_forward = stable_policy_matrix(w, n_pred)
 
     selector_pred = np.zeros((n_pred, len(endo_names)))
     for row, idx in enumerate(predetermined_indices):
@@ -123,6 +113,7 @@ def check_stochastic_singularity(
     ss_values: Dict[str, float],
 ) -> List[Diagnostic]:
     """Return W098 when first-order observable innovations are rank deficient."""
+    model = _unique_endogenous_model(model)
     observables = [
         name for name in dict.fromkeys(model.varobs_vars)
         if name in model.endogenous_names()

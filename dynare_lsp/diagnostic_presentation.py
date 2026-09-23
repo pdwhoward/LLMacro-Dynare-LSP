@@ -81,7 +81,16 @@ def _related_for_jacobian(server_module, lsp, uri, model, source_text, message):
                 )
             )
 
-    equations = model.static_model_equations()
+    # W080 equation ordinals come from the solve model, which applies
+    # model_remove / model_replace.  Number equations in that same edited
+    # view, or related locations point at the wrong (removed) equations.
+    from .diagnostics import _with_model_editing_commands
+
+    try:
+        edited = _with_model_editing_commands(model)
+    except Exception:
+        edited = model
+    equations = edited.static_model_equations()
     ordinals = {
         int(value)
         for value in re.findall(r"\bequation\s+(\d+)\b", message, re.IGNORECASE)

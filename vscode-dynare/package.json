@@ -2,7 +2,7 @@
   "name": "dynare-lsp",
   "displayName": "Dynare Language Support",
   "description": "Language support for Dynare .mod files with steady state validation",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "license": "GPL-3.0-or-later",
   "publisher": "llmacro",
   "repository": {
@@ -15,6 +15,12 @@
   },
   "engines": {
     "vscode": "^1.101.0"
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "The Dynare language server launches the Python interpreter named by dynare.pythonPath and runs the Dynare preprocessor on workspace files, so it is disabled in Restricted Mode."
+    }
   },
   "categories": [
     "Programming Languages",
@@ -58,11 +64,12 @@
         "dynare.pythonPath": {
           "type": "string",
           "default": "python",
-          "description": "Path to the Python interpreter that has dynare-lsp installed"
+          "scope": "machine-overridable",
+          "description": "Path to the Python interpreter that has dynare-lsp installed with its [all] extra (see the README). On macOS/Linux this is often python3 or a virtual-environment interpreter."
         },
         "dynare.steadyStateTolerance": {
           "type": "number",
-          "default": 1e-06,
+          "default": 6.055454452393343e-06,
           "description": "Tolerance for steady state equation residuals"
         },
         "dynare.preprocessorPath": {

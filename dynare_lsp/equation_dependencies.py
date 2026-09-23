@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from .parser import ParsedModel
+from .parser import ParsedModel, mask_float_literals
 
 _IDENTIFIER = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
 _SIMPLE_LHS = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*$")
@@ -116,11 +116,13 @@ def build_equation_dependency_graph(model: ParsedModel) -> EquationDependencyGra
             lhs_match = _SIMPLE_LHS.match(lhs)
             if lhs_match and lhs_match.group(1) in declared:
                 defines = [lhs_match.group(1)]
-            expression = rhs
+                expression = rhs
+            # Otherwise (``c + k = y``, ``1/c = ...``, ``log(z) = ...``) the
+            # LHS symbols are uses too, so scan the whole equation.
         uses = sorted(
             {
                 symbol
-                for symbol in _IDENTIFIER.findall(expression)
+                for symbol in _IDENTIFIER.findall(mask_float_literals(expression))
                 if symbol in declared
                 and symbol not in defines
                 and symbol.lower() not in _BUILTINS

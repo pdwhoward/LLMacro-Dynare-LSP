@@ -75,6 +75,13 @@ def check_deterministic_shocks(models: List[ParsedModel]) -> List[Diagnostic]:
         stripped = _strip_comments(model.text)
         anchor_override = model.include_anchor_range
         for block in _find_all_blocks(stripped, "shocks"):
+            options = (block.group(1) or "").lower()
+            if re.search(r"(?<!\w)overwrite(?!\w)", options):
+                # ``shocks(overwrite)`` replaces all earlier shocks blocks.
+                assigned.clear()
+            # ``shocks(learnt_in=N)`` deliberately re-specifies shocks that
+            # agents learn about in period N; re-using a period is the point.
+            learnt_block = re.search(r"(?<!\w)learnt_in(?!\w)", options) is not None
             body = block.group(2)
             body_start = block.start(2)
             current_name: Optional[str] = None
@@ -141,6 +148,8 @@ def check_deterministic_shocks(models: List[ParsedModel]) -> List[Diagnostic]:
                             code="E071",
                         )
                     )
+                if learnt_block:
+                    return
                 for period in periods:
                     key = (current_name, period)
                     if key in assigned:
@@ -185,5 +194,11 @@ def check_deterministic_shocks(models: List[ParsedModel]) -> List[Diagnostic]:
                     periods_expr = text[len("periods") :].strip()
                 elif lowered.startswith("values"):
                     values_expr = text[len("values") :].strip()
+                else:
+                    # ``add``/``multiply`` (learnt_in blocks) supply the
+                    # schedule's values in place of ``values``.
+                    op_match = re.match(r"(?i)(add|multiply)(?!\w)", text)
+                    if op_match is not None:
+                        values_expr = text[op_match.end() :].strip()
             finalize()
     return diagnostics

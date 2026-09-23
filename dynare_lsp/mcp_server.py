@@ -249,6 +249,42 @@ def _rebase_relative_file_keys(
     return rebased
 
 
+# Legacy tools may fall back to disk for includes the caller did not supply.
+# Bound that read: skip oversized or binary files and files whose extension
+# is not a Dynare source type, so arbitrary local files (secrets, data dumps)
+# are neither parsed for minutes nor echoed back through symbol names.
+_DISK_INCLUDE_MAX_BYTES = 4 * 1024 * 1024
+_DISK_INCLUDE_SUFFIXES = frozenset({".mod", ".inc", ".m", ".dyn"})
+
+
+def _disk_include_allowed(path: Any) -> bool:
+    from pathlib import Path
+
+    candidate = Path(path)
+    if candidate.suffix.lower() not in _DISK_INCLUDE_SUFFIXES:
+        return False
+    try:
+        if candidate.stat().st_size > _DISK_INCLUDE_MAX_BYTES:
+            return False
+        with open(candidate, "rb") as handle:
+            return b"\x00" not in handle.read(_DISK_INCLUDE_MAX_BYTES + 1)
+    except OSError:
+        return False
+
+
+def _guarded_workspace_index():
+    """WorkspaceIndex whose disk fallback applies the legacy MCP read guard."""
+    from .workspace import WorkspaceIndex
+
+    class GuardedWorkspaceIndex(WorkspaceIndex):
+        def _read_and_parse_from_disk(self, path):
+            if not _disk_include_allowed(path):
+                return None
+            return super()._read_and_parse_from_disk(path)
+
+    return GuardedWorkspaceIndex
+
+
 def _diagnostic_to_dict(d) -> Dict[str, Any]:
     """Convert a dynare_lsp.diagnostics.Diagnostic into a JSON-friendly dict."""
     return {
@@ -287,6 +323,8 @@ def build_server():
     )
     from . import explain as _explain_module
     from .workspace import WorkspaceIndex
+    # Constructed indexes guard their disk fallback; annotations keep the base.
+    _GuardedIndex = _guarded_workspace_index()
     from .workspace import _normalize_uri as _workspace_normalize_uri
     from .server import (
         _collect_cross_file_references,
@@ -367,7 +405,7 @@ def build_server():
         # fallback finds them, so mirror them into the temp tree too or
         # the preprocessor fails with a false "Could not open" on a model
         # the LSP itself accepts.
-        index = WorkspaceIndex()
+        index = _GuardedIndex()
         for fname, content in files.items():
             index.update_document(fname, content)
         try:
@@ -620,7 +658,7 @@ def build_server():
         )
         workspace_files = dict(files)
         workspace_files[active_file] = file_content
-        index = WorkspaceIndex()
+        index = _GuardedIndex()
         for fname, content in workspace_files.items():
             index.update_document(fname, content)
         parent_context, ambiguous_parents = _select_active_parent_context(
@@ -992,7 +1030,7 @@ def build_server():
             require_present=True,
         )
 
-        index = WorkspaceIndex()
+        index = _GuardedIndex()
         for fname, content in files.items():
             index.update_document(fname, content)
 
@@ -1357,7 +1395,7 @@ def build_server():
             require_present=True,
         )
 
-        index = WorkspaceIndex()
+        index = _GuardedIndex()
         for fname, content in files.items():
             index.update_document(fname, content)
 
@@ -1419,7 +1457,7 @@ def build_server():
             require_present=True,
         )
 
-        index = WorkspaceIndex()
+        index = _GuardedIndex()
         for fname, content in files.items():
             index.update_document(fname, content)
 
@@ -1521,7 +1559,7 @@ def build_server():
             files,
             require_present=True,
         )
-        index = WorkspaceIndex()
+        index = _GuardedIndex()
         for filename, content in files.items():
             index.update_document(filename, content)
         return index.trace_includes(active_file)

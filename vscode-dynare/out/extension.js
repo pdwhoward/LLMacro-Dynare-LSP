@@ -35,6 +35,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.activate = activate;
 exports.deactivate = deactivate;
+const child_process_1 = require("child_process");
 const path = __importStar(require("path"));
 const vscode = __importStar(require("vscode"));
 const vscode_1 = require("vscode");
@@ -44,6 +45,13 @@ let client;
 let clientStartPromise;
 let clientGeneration = 0;
 let currentPythonPath = "python";
+// Shared across client generations so restarts do not leak watchers or
+// output channels; created once in activate() and owned by context.subscriptions.
+let fileWatchers = [];
+let serverOutputChannel;
+// Report a failed start once per interpreter path instead of on every open.
+let reportedStartFailurePath;
+const INSTALL_COMMAND = 'pip install "dynare-lsp[all] @ git+https://github.com/pdwhoward/LLMacro-Dynare-LSP.git"';
 function configuredPythonPath() {
     const config = vscode_1.workspace.getConfiguration("dynare");
     return config.get("pythonPath", "python");
@@ -89,7 +97,7 @@ function dynareConfigurationPayload() {
     return {
         dynare: {
             pythonPath: config.get("pythonPath", "python"),
-            steadyStateTolerance: config.get("steadyStateTolerance", 1e-6),
+            steadyStateTolerance: config.get("steadyStateTolerance", 6.055454452393343e-6),
             preprocessorPath: config.get("preprocessorPath", ""),
             formatIndent: config.get("formatIndent", "tab"),
             searchPaths: configuredSearchPaths(),
@@ -119,14 +127,25 @@ function createClient(pythonPath) {
     };
     const clientOptions = {
         documentSelector: [{ scheme: "file", language: "dynare" }],
+        outputChannel: serverOutputChannel,
         synchronize: {
-            fileEvents: [
-                vscode_1.workspace.createFileSystemWatcher("**/*.mod"),
-                vscode_1.workspace.createFileSystemWatcher("**/*.inc"),
-            ],
+            fileEvents: fileWatchers,
         },
     };
     return new node_1.LanguageClient("dynareLSP", "Dynare Language Server", serverOptions, clientOptions);
+}
+function ensureSharedResources(context) {
+    if (fileWatchers.length === 0) {
+        fileWatchers = [
+            vscode_1.workspace.createFileSystemWatcher("**/*.mod"),
+            vscode_1.workspace.createFileSystemWatcher("**/*.inc"),
+        ];
+        context.subscriptions.push(...fileWatchers);
+    }
+    if (!serverOutputChannel) {
+        serverOutputChannel = vscode.window.createOutputChannel("Dynare Language Server");
+        context.subscriptions.push(serverOutputChannel);
+    }
 }
 async function stopClient(targetClient) {
     if (!targetClient.isRunning()) {
@@ -137,6 +156,47 @@ async function stopClient(targetClient) {
     }
     catch (err) {
         console.warn("Failed to stop Dynare language client", err);
+    }
+}
+function probePythonEnvironment(pythonPath) {
+    // Diagnose a failed start without delaying the normal (successful) path.
+    return new Promise((resolve) => {
+        (0, child_process_1.execFile)(pythonPath, ["-c", "import dynare_lsp"], { timeout: 20000, windowsHide: true }, (err, _stdout, stderr) => {
+            if (!err) {
+                resolve(`The interpreter "${pythonPath}" imports dynare_lsp, but the server exited ` +
+                    "during startup. See the Dynare Language Server output for details.");
+            }
+            else if (err.code === "ENOENT") {
+                resolve(`Python interpreter "${pythonPath}" was not found.`);
+            }
+            else {
+                const detail = String(stderr || err.message || "")
+                    .trim()
+                    .split(/\r?\n/)
+                    .pop();
+                resolve(`The interpreter "${pythonPath}" cannot import dynare_lsp` +
+                    `${detail ? ` (${detail})` : ""}.`);
+            }
+        });
+    });
+}
+async function reportStartFailure(pythonPath, err) {
+    serverOutputChannel?.appendLine(`Dynare language server failed to start: ${String(err)}`);
+    if (reportedStartFailurePath === pythonPath) {
+        return;
+    }
+    reportedStartFailurePath = pythonPath;
+    const reason = await probePythonEnvironment(pythonPath);
+    const openSettings = "Open dynare.pythonPath Setting";
+    const showOutput = "Show Output";
+    const choice = await vscode.window.showErrorMessage(`Dynare language server could not start. ${reason} Set "dynare.pythonPath" to a ` +
+        `Python 3.11+ interpreter (on macOS/Linux often "python3") where the server is ` +
+        `installed, e.g. ${INSTALL_COMMAND}.`, openSettings, showOutput);
+    if (choice === openSettings) {
+        await vscode.commands.executeCommand("workbench.action.openSettings", "dynare.pythonPath");
+    }
+    else if (choice === showOutput) {
+        serverOutputChannel?.show(true);
     }
 }
 function startClient(context, pythonPath) {
@@ -162,9 +222,11 @@ function startClient(context, pythonPath) {
         if (generation !== clientGeneration) {
             return;
         }
+        ensureSharedResources(context);
+        // Not pushed into context.subscriptions: each restart would otherwise
+        // retain every previous client. deactivate() stops the active client.
         const nextClient = createClient(pythonPath);
         client = nextClient;
-        context.subscriptions.push(nextClient);
         try {
             await nextClient.start();
         }
@@ -173,8 +235,12 @@ function startClient(context, pythonPath) {
                 client = undefined;
             }
             console.error("Dynare language server failed to start", err);
+            if (generation === clientGeneration) {
+                void reportStartFailure(pythonPath, err);
+            }
             return;
         }
+        reportedStartFailurePath = undefined;
         if (generation !== clientGeneration || client !== nextClient) {
             await stopClient(nextClient);
             if (client === nextClient) {
@@ -336,6 +402,7 @@ function registerMcpProvider(context) {
     }));
 }
 function activate(context) {
+    ensureSharedResources(context);
     registerMcpProvider(context);
     (0, analysisReport_1.registerAnalysisReport)(context, async () => {
         maybeStartClientForOpenDynareDocument(context);

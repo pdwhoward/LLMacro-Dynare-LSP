@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 from typing import Mapping
 
+from .incremental import split_lsp_lines
 from .parser import ParsedModel, Position, SourceRange, VarDeclaration
 
 _IDENTIFIER = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
@@ -45,7 +46,9 @@ class SemanticIndex:
 
 
 def _offset(text: str, position: Position) -> int:
-    lines = text.splitlines(keepends=True)
+    # Only CR/LF end an LSP line; str.splitlines would also split on form
+    # feeds and Unicode separators that parsed positions do not count.
+    lines = split_lsp_lines(text, keepends=True)
     return sum(len(line) for line in lines[: position.line]) + position.character
 
 

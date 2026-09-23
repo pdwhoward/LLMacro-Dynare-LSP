@@ -26,9 +26,11 @@ from .steady_state import (
     _escape_expr,
     _escape_reserved,
     _exogenous_values,
+    _normalize_numeric_expr,
     _safe_eval_expr,
     _split_equation,
     _strip_equation_tags,
+    _unique_endogenous_model,
 )
 
 if TYPE_CHECKING:
@@ -768,6 +770,7 @@ def _compute_jacobian(
     """
     import numpy as np
 
+    model = _unique_endogenous_model(model)
     endo_names = [v.name for v in model.endogenous]
     endo_set = set(endo_names)
     predetermined = {
@@ -1010,12 +1013,16 @@ def _compute_jacobian(
     _compiled_rhs: List[Optional[CodeType]] = []
     for lhs, rhs in prepared_equations:
         try:
-            _compiled_lhs.append(compile(lhs, "<bk-lhs>", "eval"))
+            _compiled_lhs.append(
+                compile(_normalize_numeric_expr(lhs), "<bk-lhs>", "eval"),
+            )
         except Exception:
             _compiled_lhs.append(None)
         if rhs is not None:
             try:
-                _compiled_rhs.append(compile(rhs, "<bk-rhs>", "eval"))
+                _compiled_rhs.append(
+                    compile(_normalize_numeric_expr(rhs), "<bk-rhs>", "eval"),
+                )
             except Exception:
                 _compiled_rhs.append(None)
         else:
@@ -1024,7 +1031,9 @@ def _compute_jacobian(
     _compiled_local_exprs: List[Optional[CodeType]] = []
     for _lname, lexpr in local_var_defs:
         try:
-            _compiled_local_exprs.append(compile(lexpr, "<bk-local>", "eval"))
+            _compiled_local_exprs.append(
+                compile(_normalize_numeric_expr(lexpr), "<bk-local>", "eval"),
+            )
         except Exception:
             _compiled_local_exprs.append(None)
 
@@ -1264,6 +1273,159 @@ def _generalized_eigenvalues(
     return eigenvalues
 
 
+# Dynare's default ``qz_criterium`` for stoch_simul/check (1 + 1e-6) and the
+# ``rcond(Z22) < 1e-9`` rank-failure threshold used by
+# ``dyn_first_order_solver.m`` (info=5).
+DYNARE_DEFAULT_QZ_CRITERIUM = 1.0 + 1e-6
+DYNARE_RANK_RCOND_THRESHOLD = 1e-9
+
+
+def _max_pencil_dimension() -> int:
+    """Largest QZ pencil the interactive BK check will decompose.
+
+    QZ is O(n^3): a 2720-dimensional pencil (US_MR07 after the auxiliary
+    lag transformation) takes ~160 s.  Tunable via
+    DYNARE_LSP_BK_MAX_PENCIL (<= 0 disables the guard).
+    """
+    import os
+
+    try:
+        value = int(os.environ.get("DYNARE_LSP_BK_MAX_PENCIL", "1500"))
+    except ValueError:
+        return 1500
+    return value
+
+_QZ_CRITERIUM_OPTION_RE = re.compile(
+    r"\bqz_criterium\s*=\s*([+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)",
+)
+_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+_LINE_COMMENT_RE = re.compile(r"(?://|%)[^\r\n]*")
+
+
+def user_qz_criterium(model: ParsedModel) -> Optional[float]:
+    """Return an explicit ``qz_criterium=<number>`` command option, if any.
+
+    Dynare writes command options into the global ``options_`` structure, so
+    the first explicit setting governs the first solve and persists for later
+    commands.  Only literal numeric values are honoured; anything else leaves
+    Dynare's stoch_simul/check default (1 + 1e-6) in place.
+    """
+    text = getattr(model, "text", "") or ""
+    if "qz_criterium" not in text:
+        return None
+    stripped = _LINE_COMMENT_RE.sub("", _BLOCK_COMMENT_RE.sub("", text))
+    match = _QZ_CRITERIUM_OPTION_RE.search(stripped)
+    if match is None:
+        return None
+    try:
+        value = float(match.group(1))
+    except ValueError:
+        return None
+    if not (value > 0.0) or value != value or value == float("inf"):
+        return None
+    return value
+
+
+def dynare_ordered_qz(
+    A: "numpy.ndarray",
+    B: "numpy.ndarray",
+    qz_criterium: float = DYNARE_DEFAULT_QZ_CRITERIUM,
+) -> Tuple["numpy.ndarray", "numpy.ndarray", "numpy.ndarray", int]:
+    """Stable-first real generalized Schur decomposition, as Dynare's ``mjdgges``.
+
+    ``A`` and ``B`` are the pencil ``B x(t+1) = A x(t)`` with
+    ``x(t) = [y_P(t-1); y_F(t)]`` (Dynare's ``E`` and ``D``).  Roots are
+    ordered with the *stable* ones first, using exactly mjdgges' selection
+    rule ``alpha_r^2 + alpha_i^2 < qz_criterium^2 * beta^2``.
+
+    Returns ``(alpha, beta, w, sdim)`` where ``w`` holds the right Schur
+    vectors (Dynare's ``w``/LAPACK ``VSR``): its first ``sdim`` columns span
+    the stable deflating subspace.
+    """
+    import numpy as np
+    from scipy.linalg import ordqz
+
+    n = A.shape[0]
+    if n == 0:
+        empty = np.zeros(0, dtype=complex)
+        return empty, empty, np.zeros((0, 0)), 0
+
+    crit_sq = float(qz_criterium) ** 2
+
+    def _stable(alpha, beta):
+        alpha = np.asarray(alpha)
+        beta = np.asarray(beta)
+        return np.abs(alpha) ** 2 < crit_sq * np.abs(beta) ** 2
+
+    try:
+        _aa, _bb, alpha, beta, _q, w = ordqz(
+            A, B, sort=cast(Any, _stable), output="real",
+        )
+    except ValueError:
+        # Real reordering can fail on very ill-conditioned pencils; the
+        # complex form spans the same deflating subspaces.
+        _aa, _bb, alpha, beta, _q, w = ordqz(
+            A, B, sort=cast(Any, _stable), output="complex",
+        )
+    alpha = np.asarray(alpha)
+    beta = np.asarray(beta)
+    sdim = int(np.count_nonzero(_stable(alpha, beta)))
+    return alpha, beta, w, sdim
+
+
+def dynare_rank_rcond(w: "numpy.ndarray", n_predetermined: int) -> float:
+    """Reciprocal 1-norm condition number of Dynare's ``Z22`` block.
+
+    ``dyn_first_order_solver.m`` forms ``Z = w'`` and
+    ``Z22 = Z(npred+nboth+1:end, npred+nboth+1:end)``, i.e. the transpose of
+    ``w[forward rows, explosive columns]``.  ``Z22`` is invertible exactly
+    when the stable deflating subspace maps one-to-one onto the predetermined
+    coordinates (the CS decomposition of the orthogonal ``w`` gives the two
+    blocks identical singular values).  Dynare reports info=5 when
+    ``rcond(Z22) < 1e-9``.
+    """
+    import numpy as np
+
+    z22 = np.asarray(w[n_predetermined:, n_predetermined:]).T
+    if z22.size == 0:
+        return 1.0
+    if not np.all(np.isfinite(z22)):
+        return 0.0
+    try:
+        with np.errstate(all="ignore"):
+            cond = float(np.linalg.cond(z22, 1))
+    except np.linalg.LinAlgError:
+        return 0.0
+    if not np.isfinite(cond) or cond <= 0.0:
+        return 0.0
+    return 1.0 / cond
+
+
+def stable_policy_matrix(
+    w: "numpy.ndarray",
+    n_predetermined: int,
+) -> "numpy.ndarray":
+    """Return ``H`` with ``y_F(t) = H y_P(t-1)`` on the stable manifold.
+
+    With stable-first ordering, ``x(t) = w[:, :n_P] c``; eliminating ``c``
+    through the predetermined rows gives
+    ``H = w[F, :n_P] @ inv(w[P, :n_P])``.  Dynare's ``gx = -Z22 \\ Z21``
+    is the same matrix (orthogonality of ``w``).  Raises ``ValueError`` when
+    the rank condition fails.
+    """
+    import numpy as np
+
+    n_dyn = w.shape[0]
+    n_forward = n_dyn - n_predetermined
+    if n_predetermined == 0:
+        return np.zeros((n_forward, 0), dtype=w.dtype)
+    if dynare_rank_rcond(w, n_predetermined) < DYNARE_RANK_RCOND_THRESHOLD:
+        raise ValueError("stable invariant subspace is rank deficient")
+    w_pred = w[:n_predetermined, :n_predetermined]
+    w_forward = w[n_predetermined:, :n_predetermined]
+    return np.linalg.solve(w_pred.T, w_forward.T).T
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -1271,7 +1433,7 @@ def _generalized_eigenvalues(
 def check_blanchard_kahn(
     model: ParsedModel,
     ss_values: Dict[str, float],
-    unit_root_tol: float = 1e-6,
+    unit_root_tol: Optional[float] = None,
     *,
     _allow_auxiliary_transform: bool = True,
 ) -> BKResult:
@@ -1282,19 +1444,32 @@ def check_blanchard_kahn(
     Parameters:
         model: Parsed Dynare model
         ss_values: Steady state values (from solver)
-        unit_root_tol: Tolerance for classifying eigenvalues (|lambda| > 1 + tol)
+        unit_root_tol: Tolerance for classifying eigenvalues: a root is
+            stable when |lambda| < 1 + tol (Dynare's ``qz_criterium``).
+            ``None`` (default) uses an explicit ``qz_criterium=`` command
+            option from the model, else Dynare's default 1 + 1e-6.
 
     Returns:
         BKResult with eigenvalue counts and pass/fail status
     """
     try:
         import numpy as np
-        from scipy.linalg import ordqz
+        import scipy.linalg  # noqa: F401
     except ImportError:
         return BKResult(
             satisfied=False, n_unstable=0, n_forward=0,
             eigenvalues=[], message="scipy required for BK check",
         )
+
+    model = _unique_endogenous_model(model)
+    if unit_root_tol is None:
+        # Resolve the model's own qz_criterium option once, before any
+        # auxiliary-variable rewrite produces a derived model.
+        user_criterium = user_qz_criterium(model)
+        unit_root_tol = (
+            user_criterium if user_criterium is not None
+            else DYNARE_DEFAULT_QZ_CRITERIUM
+        ) - 1.0
 
     # Extract variable timing once; thread it into helpers to avoid recomputation.
     timing = _extract_variable_timing(model)
@@ -1426,7 +1601,30 @@ def check_blanchard_kahn(
         )
 
     linearization = np.hstack([f_yp, f_y0, f_ym])
-    rank = int(np.linalg.matrix_rank(linearization))
+    if not np.all(np.isfinite(linearization)):
+        return BKResult(
+            satisfied=False, n_unstable=0, n_forward=n_forward,
+            eigenvalues=[],
+            message=(
+                "Blanchard-Kahn check skipped: the linearization at the "
+                "steady state contains Inf or NaN derivatives."
+            ),
+            forward_variables=forward_vars,
+            predetermined_variables=predetermined_vars,
+        )
+    try:
+        rank = int(np.linalg.matrix_rank(linearization))
+    except np.linalg.LinAlgError as e:
+        return BKResult(
+            satisfied=False, n_unstable=0, n_forward=n_forward,
+            eigenvalues=[],
+            message=(
+                "Blanchard-Kahn check skipped: rank of the linearization "
+                f"could not be computed ({e})."
+            ),
+            forward_variables=forward_vars,
+            predetermined_variables=predetermined_vars,
+        )
     if rank < n_endo:
         return BKResult(
             satisfied=False, n_unstable=0, n_forward=n_forward,
@@ -1461,22 +1659,28 @@ def check_blanchard_kahn(
             predetermined_variables=predetermined_vars,
         )
 
-    qz_criterium = 1 + unit_root_tol
+    qz_criterium = 1.0 + unit_root_tol
 
-    def _is_explosive(alpha, beta):
-        return np.abs(alpha) > qz_criterium * np.abs(beta)
+    max_dim = _max_pencil_dimension()
+    if max_dim > 0 and A.shape[0] > max_dim:
+        return BKResult(
+            satisfied=False, n_unstable=0, n_forward=n_forward,
+            eigenvalues=[],
+            message=(
+                "Blanchard-Kahn check skipped: the first-order pencil has "
+                f"dimension {A.shape[0]}, above the interactive limit "
+                f"{max_dim} (DYNARE_LSP_BK_MAX_PENCIL); the QZ decomposition "
+                "would take minutes."
+            ),
+            forward_variables=forward_vars,
+            predetermined_variables=predetermined_vars,
+        )
 
-    # Compute generalized eigenvalues.  A zero beta is a genuine infinite
-    # generalized root in the minimal pencil and counts as explosive.
+    # Compute generalized eigenvalues with Dynare's stable-first ordering
+    # (mjdgges).  A zero beta is a genuine infinite generalized root in the
+    # minimal pencil and counts as explosive.
     try:
-        if A.shape[0] == 0:
-            alpha = np.array([], dtype=complex)
-            beta = np.array([], dtype=complex)
-            z = np.zeros((0, 0), dtype=complex)
-        else:
-            _aa, _bb, alpha, beta, _q, z = ordqz(
-                A, B, sort=cast(Any, _is_explosive), output="complex",
-            )
+        alpha, beta, w, sdim = dynare_ordered_qz(A, B, qz_criterium)
     except Exception as e:
         return BKResult(
             satisfied=False, n_unstable=0, n_forward=n_forward,
@@ -1497,32 +1701,31 @@ def check_blanchard_kahn(
             forward_variables=forward_vars,
             predetermined_variables=predetermined_vars,
         )
-    n_unstable = int(np.count_nonzero(_is_explosive(alpha, beta)))
+    n_unstable = int(len(alpha) - sdim)
 
-    # BK condition: n_unstable == n_forward
+    # BK order condition: n_unstable == n_forward (Dynare: nba == nsfwrd)
     satisfied = (n_unstable == n_forward)
     rank_message: Optional[str] = None
 
-    if satisfied and n_forward > 0 and n_unstable > 0:
+    if satisfied and n_forward > 0:
+        # Rank condition exactly as dyn_first_order_solver.m: with stable
+        # roots first, Z22 = w(forward rows, explosive columns)' must be
+        # invertible (rcond >= 1e-9), i.e. the stable subspace must map
+        # one-to-one onto the predetermined variables.  Otherwise info=5.
         try:
             n_predetermined = len(predetermined_indices)
-            forward_rows = list(range(
-                n_predetermined,
-                n_predetermined + n_forward,
-            ))
-            unstable_current_rows = z[forward_rows, :n_unstable]
-            forward_rank = int(np.linalg.matrix_rank(
-                unstable_current_rows,
-            ))
-            if forward_rank < n_forward:
+            rcond = dynare_rank_rcond(w, n_predetermined)
+            if rcond < DYNARE_RANK_RCOND_THRESHOLD:
                 satisfied = False
                 rank_message = (
                     "Blanchard & Kahn conditions are not satisfied: "
                     "indeterminacy due to rank failure. The order condition "
                     f"holds ({n_unstable} eigenvalue(s) larger than 1 in "
                     f"modulus for {n_forward} forward-looking variable(s)), "
-                    "but the rank condition is NOT verified (unstable-root "
-                    f"rank {forward_rank} is below {n_forward})."
+                    "but the rank condition is NOT verified: the stable "
+                    "subspace does not map one-to-one onto the predetermined "
+                    f"variables (rcond(Z22) = {rcond:.3g} < "
+                    f"{DYNARE_RANK_RCOND_THRESHOLD:g}; Dynare info=5)."
                 )
         except Exception as e:
             satisfied = False

@@ -9,6 +9,53 @@ from typing import Any, Iterable
 from .parser import ParsedModel, _strip_non_macro_comments
 from . import runtime_dispatch
 
+# LSP recognizes only LF, CRLF, and CR as line terminators.  Python's
+# ``str.splitlines`` also splits on \v, \f, \x1c-\x1e, \x85, U+2028 and
+# U+2029, which remain ordinary document content for an LSP client.
+LSP_LINE_BREAK_RE = re.compile(r"\r\n|\r|\n")
+_LSP_LINE_KEEPENDS_RE = re.compile(r"(?<=\n)|(?<=\r)(?!\n)")
+
+
+def split_lsp_lines(text: str, keepends: bool = False) -> list[str]:
+    """Split *text* into LSP lines (only CRLF, CR, and LF end a line).
+
+    Without *keepends* this mirrors ``str.split("\\n")``: a trailing line
+    break yields a final empty line.  With *keepends* it mirrors
+    ``str.splitlines(True)``: there is no trailing empty element.
+    """
+    if not keepends:
+        return LSP_LINE_BREAK_RE.split(text)
+    lines = _LSP_LINE_KEEPENDS_RE.split(text)
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def count_lsp_line_breaks(text: str) -> int:
+    return sum(1 for _ in LSP_LINE_BREAK_RE.finditer(text))
+
+
+def install_lsp_line_splitter() -> None:
+    """Make pygls documents split lines the way LSP clients do.
+
+    pygls 2.x computes ``TextDocument.lines`` with ``str.splitlines(True)``.
+    After an incremental edit on a document containing, e.g., a form feed,
+    pygls applied the edit to the wrong line and its ``source`` silently
+    diverged from the editor buffer and from this server's tracked text.
+    """
+    try:
+        from pygls.workspace.text_document import TextDocument
+    except ImportError:  # pragma: no cover - pygls is a runtime dependency
+        return
+    if getattr(TextDocument, "_dynare_lsp_line_splitter", False):
+        return
+
+    def lines(self):
+        return tuple(split_lsp_lines(self.source, keepends=True))
+
+    setattr(TextDocument, "lines", property(lines))
+    setattr(TextDocument, "_dynare_lsp_line_splitter", True)
+
 
 def _value(obj: Any, name: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
@@ -57,7 +104,7 @@ def _position_to_offset(text: str, position: Any, position_encoding: Any) -> int
     character = max(0, int(_value(position, "character", 0)))
     # LSP recognizes only LF, CRLF, and CR as line endings. Python's
     # splitlines() also splits Unicode separators that remain document content.
-    lines = re.split(r"(?<=\n)|(?<=\r)(?!\n)", text)
+    lines = _LSP_LINE_KEEPENDS_RE.split(text)
     if not lines:
         return 0
     if line_number >= len(lines):
@@ -94,12 +141,22 @@ def apply_content_changes(
 
 def can_reuse_semantic_model(old_text: str, new_text: str) -> bool:
     """True for same-offset edits confined to ordinary comments."""
-    return (
-        len(old_text) == len(new_text)
-        and old_text.count("\n") == new_text.count("\n")
-        and _strip_non_macro_comments(old_text)
-        == _strip_non_macro_comments(new_text)
-    )
+    if len(old_text) != len(new_text):
+        return False
+    if count_lsp_line_breaks(old_text) != count_lsp_line_breaks(new_text):
+        return False
+    # The comment stripper ends ``//`` comments at LF only; compare in the
+    # LF-normalized form the parser analyses so a CR-only file's "comment"
+    # does not swallow the rest of the document.
+    return _strip_non_macro_comments(
+        _normalize_line_breaks(old_text)
+    ) == _strip_non_macro_comments(_normalize_line_breaks(new_text))
+
+
+def _normalize_line_breaks(text: str) -> str:
+    if "\r" not in text:
+        return text
+    return LSP_LINE_BREAK_RE.sub("\n", text)
 
 
 def rebind_model_source(model: ParsedModel, source: str) -> ParsedModel:
@@ -154,6 +211,7 @@ def install(core) -> None:
     if getattr(core, "_incremental_extension_installed", False):
         return
     core._incremental_extension_installed = True
+    install_lsp_line_splitter()
     core._document_sources = {}
     _install_workspace_fast_update(core)
 

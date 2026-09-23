@@ -30,6 +30,7 @@ to dict access only — parsing and disk I/O run without the lock held.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import re
@@ -64,6 +65,20 @@ from .parser import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _accepts_root_key(method: Any) -> bool:
+    """Whether a ``_resolve_directive`` implementation takes ``root_key``."""
+    if method is WorkspaceIndex._resolve_directive:
+        return True
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return False
+    return "root_key" in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 def _path_key(path: Path) -> str:
@@ -599,8 +614,25 @@ class WorkspaceIndex:
             while path in side_paths:
                 side_paths.remove(path)
 
-    def _includepath_paths(self, key: str, directive: MacroDirective) -> List[Path]:
-        including_dir = Path(key).parent if Path(key).is_absolute() else None
+    @staticmethod
+    def _working_dir_for_root(root_key: Optional[str]) -> Optional[Path]:
+        """Dynare's process working directory for an entry file (its folder)."""
+        if not root_key:
+            return None
+        root = Path(root_key)
+        return root.parent if root.is_absolute() else None
+
+    def _includepath_paths(
+        self,
+        key: str,
+        directive: MacroDirective,
+        root_key: Optional[str] = None,
+    ) -> List[Path]:
+        # Dynare resolves a relative @#includepath against its working
+        # directory (the entry model's folder), not the declaring file.
+        including_dir = self._working_dir_for_root(root_key)
+        if including_dir is None:
+            including_dir = Path(key).parent if Path(key).is_absolute() else None
         paths: List[Path] = []
         if not directive.argument:
             return paths
@@ -1181,7 +1213,7 @@ class WorkspaceIndex:
                                 effective_defines,
                             ),
                         )
-                    new_paths = self._includepath_paths(current_key, directive)
+                    new_paths = self._includepath_paths(current_key, directive, root_key)
                     added_paths = [path for path in new_paths if path not in side_paths]
                     side_paths = self._append_unique(side_paths, new_paths)
                     if was_uncertain:
@@ -1217,10 +1249,11 @@ class WorkspaceIndex:
                         self._directive_context(current_model, resolved_directive)
                         or inherited_context
                     )
-                    resolved = self._resolve_directive(
+                    resolved = self._resolve_walk_directive(
                         current_key,
                         resolved_directive.filename,
                         effective_paths,
+                        root_key=root_key,
                     )
                     if resolved is None:
                         continue
@@ -1717,6 +1750,9 @@ class WorkspaceIndex:
         including_key: str,
         filename: str,
         active_search_paths: Optional[List[Path]] = None,
+        *,
+        root_key: Optional[str] = None,
+        strict: bool = False,
     ) -> Optional[Path]:
         """Resolve a directive filename against the index's search paths.
 
@@ -1734,7 +1770,35 @@ class WorkspaceIndex:
             including_key,
             search_paths,
             known_paths=known_paths,
+            working_dir=self._working_dir_for_root(root_key),
+            strict=strict,
         )
+
+    def _resolve_walk_directive(
+        self,
+        including_key: str,
+        filename: str,
+        active_search_paths: List[Path],
+        *,
+        root_key: str,
+        strict: bool = False,
+    ) -> Optional[Path]:
+        """Resolve an include reached while walking from *root_key*.
+
+        Passes Dynare's working directory (the root model's folder) so nested
+        relative includes resolve the way the preprocessor resolves them.
+        Subclasses that override :meth:`_resolve_directive` with the older
+        three-argument signature keep working (with their own semantics).
+        """
+        if _accepts_root_key(type(self)._resolve_directive):
+            return self._resolve_directive(
+                including_key,
+                filename,
+                active_search_paths,
+                root_key=root_key,
+                strict=strict,
+            )
+        return self._resolve_directive(including_key, filename, active_search_paths)
 
     def trace_includes(self, uri: str) -> Dict[str, Any]:
         """Return an ordered explanation of macro-aware include resolution.
@@ -1828,7 +1892,7 @@ class WorkspaceIndex:
                                 effective_defines,
                             ),
                         )
-                    new_paths = self._includepath_paths(current_key, directive)
+                    new_paths = self._includepath_paths(current_key, directive, root_key)
                     added_paths = [path for path in new_paths if path not in side_paths]
                     side_paths = self._append_unique(side_paths, new_paths)
                     if uncertain:
@@ -1867,6 +1931,7 @@ class WorkspaceIndex:
                         current_key,
                         search_paths,
                         known_paths=known_paths,
+                        working_dir=self._working_dir_for_root(root_key),
                     )
                     resolved_path = resolution.get("resolved_path")
                     resolved_key = (
@@ -2106,7 +2171,7 @@ class WorkspaceIndex:
                                 effective_defines,
                             ),
                         )
-                    new_paths = self._includepath_paths(current_key, directive)
+                    new_paths = self._includepath_paths(current_key, directive, root_key)
                     side_paths = self._append_unique(side_paths, new_paths)
                     if was_uncertain:
                         end_line = self._macro_side_effect_scope_end(
@@ -2141,10 +2206,11 @@ class WorkspaceIndex:
                         resolved_directive,
                     )
                     context = local_context or inherited_context
-                    resolved = self._resolve_directive(
+                    resolved = self._resolve_walk_directive(
                         current_key,
                         resolved_directive.filename,
                         effective_paths,
+                        root_key=root_key,
                     )
                     if resolved is None:
                         continue
@@ -2364,7 +2430,7 @@ class WorkspaceIndex:
                                 effective_defines,
                             ),
                         )
-                    new_paths = self._includepath_paths(node, directive)
+                    new_paths = self._includepath_paths(node, directive, root_key)
                     side_paths = self._append_unique(side_paths, new_paths)
                     if was_uncertain:
                         end_line = self._macro_side_effect_scope_end(model, line)
@@ -2391,10 +2457,11 @@ class WorkspaceIndex:
                             include_defines,
                         ),
                     )
-                    resolved = self._resolve_directive(
+                    resolved = self._resolve_walk_directive(
                         node,
                         resolved_directive.filename,
                         effective_paths,
+                        root_key=root_key,
                     )
                     if resolved is None:
                         continue
@@ -2545,7 +2612,7 @@ class WorkspaceIndex:
                                 effective_defines,
                             ),
                         )
-                    new_paths = self._includepath_paths(current_key, directive)
+                    new_paths = self._includepath_paths(current_key, directive, root_key)
                     side_paths = self._append_unique(side_paths, new_paths)
                     if was_uncertain:
                         end_line = self._macro_side_effect_scope_end(model, line)
@@ -2572,10 +2639,12 @@ class WorkspaceIndex:
                             include_defines,
                         ),
                     )
-                    resolved = self._resolve_directive(
+                    resolved = self._resolve_walk_directive(
                         current_key,
                         resolved_directive.filename,
                         effective_paths,
+                        root_key=root_key,
+                        strict=True,
                     )
                     if resolved is None:
                         if current_key == root_key or root_directive is None:

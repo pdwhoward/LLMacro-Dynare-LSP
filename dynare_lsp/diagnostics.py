@@ -10,6 +10,7 @@ Generates LSP-compatible diagnostics from a parsed model, covering:
 
 from __future__ import annotations
 
+import functools
 import re
 from collections import Counter
 from dataclasses import dataclass, replace
@@ -37,6 +38,7 @@ from .parser import (
     _strip_comments,
     _strip_non_macro_comments,
     _unresolved_macro_for_template_ranges,
+    mask_float_literals,
     parse,
 )
 from .performance import record_work
@@ -1053,6 +1055,8 @@ def _extract_references(
     # Remove string literals
     cleaned = re.sub(r"'[^']*'", "", cleaned)
     cleaned = re.sub(r'"[^"]*"', "", cleaned)
+    # ``1.E-3`` / ``3.D0``: keep the exponent from reading as an identifier.
+    cleaned = mask_float_literals(cleaned)
     timed_identifiers = {
         name
         for name in _TIMED_IDENTIFIER_RE.findall(cleaned)
@@ -1120,7 +1124,17 @@ def _mask_non_code_for_reference_search(text: str) -> str:
     masked = _mask_strings_preserving_mcp_values(text)
     masked = re.sub(r"/\*.*?\*/", _blank, masked, flags=re.DOTALL)
     masked = re.sub(r"(?://|%).*$", _blank, masked, flags=re.MULTILINE)
-    return masked
+    return mask_float_literals(masked)
+
+
+@functools.lru_cache(maxsize=8)
+def _masked_reference_search_lines(text: str) -> Tuple[str, ...]:
+    """Cached per-line masked text for whole-file reference searches.
+
+    ``_find_reference_range_in_equation`` runs once per reference; re-masking
+    the whole file each time was quadratic on models with many locals.
+    """
+    return tuple(_mask_non_code_for_reference_search(text).split("\n"))
 
 
 def _mask_macro_directive_lines(text: str) -> str:
@@ -1144,7 +1158,7 @@ def _find_reference_range_in_equation(
     """Return the first code occurrence of *ref* within an equation range."""
     if not ref:
         return None
-    masked_lines = _mask_non_code_for_reference_search(text).split("\n")
+    masked_lines = _masked_reference_search_lines(text)
     if equation_range.start.line >= len(masked_lines):
         return None
     last_line = min(equation_range.end.line, len(masked_lines) - 1)
@@ -1177,7 +1191,7 @@ def _find_timed_identifier_ranges_in_equation(
     equation_range: SourceRange,
 ) -> List[Tuple[str, SourceRange]]:
     """Return timed identifier occurrences within an equation range."""
-    masked_lines = _mask_non_code_for_reference_search(text).split("\n")
+    masked_lines = _masked_reference_search_lines(text)
     if equation_range.start.line >= len(masked_lines):
         return []
     occurrences: List[Tuple[str, SourceRange]] = []
@@ -1533,7 +1547,11 @@ def _check_invalid_identifier_declarations(model: ParsedModel) -> List[Diagnosti
         if _inside_block(match.start(), block_exclusions):
             continue
         body = match.group(2)
-        masked_body = re.sub(r"\$[^$\n]*\$", lambda m: " " * len(m.group(0)), body)
+        # Dynare's TEX_NAME token is ``\$[^$]*\$`` -- it may span line breaks
+        # (including a lone CR the parser normalises to ``\n``).
+        masked_body = re.sub(
+            r"\$[^$]*\$", lambda m: re.sub(r"[^\n]", " ", m.group(0)), body
+        )
         masked_body = re.sub(
             r"\([^()]*\)", lambda m: " " * len(m.group(0)), masked_body
         )
@@ -1807,6 +1825,15 @@ def _check_model_local_shadowing(model: ParsedModel) -> List[Diagnostic]:
     return diagnostics
 
 
+def _unique_endogenous_count(model: ParsedModel) -> int:
+    """Number of distinct endogenous names.
+
+    Dynare tolerates re-declaring a symbol with the same type (``var y c;
+    var y;`` only warns), so a duplicate must not count as an extra unknown.
+    """
+    return len({v.name for v in model.endogenous})
+
+
 def _check_equation_count(model: ParsedModel) -> List[Diagnostic]:
     """Check that number of equations matches number of endogenous variables."""
     diagnostics: List[Diagnostic] = []
@@ -1816,7 +1843,7 @@ def _check_equation_count(model: ParsedModel) -> List[Diagnostic]:
 
     real_equations = model.dynamic_model_equations()
     n_eq = len(real_equations)
-    n_endo = len(model.endogenous)
+    n_endo = _unique_endogenous_count(model)
     if n_eq == 0 and n_endo == 0:
         return diagnostics
 
@@ -2535,7 +2562,7 @@ def _check_missing_steady_state(model: ParsedModel) -> List[Diagnostic]:
 
     # Check equation count matches (solver needs N equations = N unknowns)
     real_equations = model.static_model_equations()
-    if len(real_equations) != len(model.endogenous):
+    if len(real_equations) != _unique_endogenous_count(model):
         return diagnostics
 
     rng = model.model_block_range
@@ -2631,7 +2658,9 @@ def _check_steady_state_operator_operands(
             bad_names = sorted(
                 {
                     name
-                    for name in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", operand)
+                    for name in re.findall(
+                        r"\b[A-Za-z_][A-Za-z0-9_]*\b", mask_float_literals(operand)
+                    )
                     if name in exogenous
                 }
             )
@@ -3321,7 +3350,7 @@ def _check_macro_branch_equation_count(model: ParsedModel) -> List[Diagnostic]:
     counts = _macro_branch_equation_counts(model)
     if not counts:
         return []
-    n_endo = len(model.endogenous)
+    n_endo = _unique_endogenous_count(model)
     # When the resolved (active) configuration balances and the branch
     # arithmetic yields a single count, trust the resolved model: a lone count
     # that disagrees with a balanced model is a counting artifact of
@@ -3739,6 +3768,25 @@ def _check_unbalanced_parens(model: ParsedModel) -> List[Diagnostic]:
     return diagnostics
 
 
+def _standalone_equals_positions(masked: str) -> List[int]:
+    """Offsets of ``=`` that are not part of ``==``/``!=``/``<=``/``>=``/``~=``."""
+    positions: List[int] = []
+    i = 0
+    n = len(masked)
+    while i < n:
+        ch = masked[i]
+        if ch == "=" and i + 1 < n and masked[i + 1] == "=":
+            i += 2
+        elif ch in ("<", ">", "~", "!") and i + 1 < n and masked[i + 1] == "=":
+            i += 2
+        elif ch == "=":
+            positions.append(i)
+            i += 1
+        else:
+            i += 1
+    return positions
+
+
 def _check_merged_equations(model: ParsedModel) -> List[Diagnostic]:
     """Detect model equations that appear to be two equations merged due to
     a missing semicolon (contain multiple '=' signs).
@@ -3757,8 +3805,11 @@ def _check_merged_equations(model: ParsedModel) -> List[Diagnostic]:
 
         # Remove equation tags [name='...']
         cleaned = re.sub(r"\[[^\]]*\]", "", text)
-        # Count equals signs
-        eq_count = cleaned.count("=")
+        # Count standalone ``=`` separators; ``cleaned.count("=")`` would also
+        # count the comparison operators ``==``/``!=``/``<=``/``>=``.
+        eq_count = len(
+            _standalone_equals_positions(_mask_non_code_for_reference_search(cleaned))
+        )
         if eq_count >= 2:
             # This is likely two equations merged due to a missing semicolon
             # Find the position of the second '=' to suggest where the split should be
@@ -3787,27 +3838,7 @@ def _check_merged_equations(model: ParsedModel) -> List[Diagnostic]:
                 r"\[[^\]]*\]", _blank_preserve_newlines, masked_segment
             )
 
-            eq_positions: List[int] = []
-            i = 0
-            while i < len(masked_segment):
-                ch = masked_segment[i]
-                if (
-                    ch == "="
-                    and i + 1 < len(masked_segment)
-                    and masked_segment[i + 1] == "="
-                ):
-                    i += 2
-                elif (
-                    ch in ("<", ">", "~", "!")
-                    and i + 1 < len(masked_segment)
-                    and masked_segment[i + 1] == "="
-                ):
-                    i += 2
-                elif ch == "=":
-                    eq_positions.append(i)
-                    i += 1
-                else:
-                    i += 1
+            eq_positions = _standalone_equals_positions(masked_segment)
 
             if len(eq_positions) >= 2:
                 # Walk left from the second standalone "=" to find the
@@ -3822,8 +3853,7 @@ def _check_merged_equations(model: ParsedModel) -> List[Diagnostic]:
                     k -= 1
                 candidate = masked_segment[k:ident_end]
                 if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", candidate):
-                    if split_var is None:
-                        split_var = candidate
+                    split_var = candidate
                     split_offset = source_start + k
                     split_pos = _offset_to_position_local(model.text, split_offset)
                     lines = model.text.split("\n")
@@ -4933,7 +4963,7 @@ def run_diagnostics(
         # the fix is to add those identifiers to `var` declaration.
         real_eqs = equation_count_model.dynamic_model_equations()
         n_eq = len(real_eqs)
-        n_endo = len(equation_count_model.endogenous)
+        n_endo = _unique_endogenous_count(equation_count_model)
         if n_eq > n_endo and undeclared_diags and not equation_count_unreliable:
             n_extra = n_eq - n_endo
             n_undecl = len(undeclared_diags)

@@ -62,7 +62,7 @@ def main() -> None:
         "--solve",
         action="store_true",
         help="Compute the deterministic steady state (requires scipy). "
-        "Use with --check.",
+        "Use with --check. Failed or unavailable BK checks exit nonzero.",
     )
     parser.add_argument(
         "--explain",
@@ -94,6 +94,12 @@ def main() -> None:
             parser.error("argument --check: expected one argument")
     if unknown:
         parser.error(f"unrecognized arguments: {' '.join(unknown)}")
+    # A CLI-only flag must never fall through to starting the stdio server
+    # (which would block waiting for JSON-RPC on stdin).
+    if args.list and args.explain is None:
+        parser.error("--list is only valid with --explain (use: --explain --list)")
+    if args.check is not None and not str(args.check).strip():
+        parser.error("argument --check: expected a non-empty file path")
 
     if args.explain:
         _run_explain(args.explain, list_only=args.list or args.explain == "--list")
@@ -227,7 +233,7 @@ def _run_check(filepath: str, solve: bool = False) -> None:
 
 
 def _run_solve(text: str, filepath: str, model=None) -> None:
-    """Compute the steady state and print results."""
+    """Compute the steady state; numerical failures must not exit successfully."""
     from .diagnostics import _with_model_editing_commands
     from .parser import parse
 
@@ -245,6 +251,7 @@ def _run_solve(text: str, filepath: str, model=None) -> None:
     model = _with_model_editing_commands(model)
     print(f"\nSolving steady state for {filepath}...")
     result = compute_steady_state(model)
+    numerical_failed = False
 
     if result.success:
         print(f"Converged: {result.message}")
@@ -270,13 +277,15 @@ def _run_solve(text: str, filepath: str, model=None) -> None:
 
             bk = check_blanchard_kahn(model, result.values)
             print(f"\n{bk.message}")
+            numerical_failed |= (
+                not bk.satisfied or "check skipped" in (bk.message or "").lower()
+            )
             if bk.forward_variables:
                 print(f"  Forward-looking: {', '.join(bk.forward_variables)}")
             if bk.predetermined_variables:
                 print(f"  Predetermined:   {', '.join(bk.predetermined_variables)}")
-        except ImportError:
-            pass
         except Exception as e:
+            numerical_failed = True
             print(f"\nBK check failed: {e}", file=sys.stderr)
 
         try:
@@ -284,6 +293,7 @@ def _run_solve(text: str, filepath: str, model=None) -> None:
 
             model_diagnostics = check_model_diagnostics(model, result.values)
             for diagnostic in model_diagnostics:
+                numerical_failed |= diagnostic.severity == 1
                 severity_str = {
                     1: "ERROR",
                     2: "WARNING",
@@ -300,6 +310,7 @@ def _run_solve(text: str, filepath: str, model=None) -> None:
         except ImportError:
             pass
         except Exception as e:
+            numerical_failed = True
             print(f"\nModel diagnostics failed: {e}", file=sys.stderr)
 
         # Per-equation steady-state residuals (resid)
@@ -308,6 +319,9 @@ def _run_solve(text: str, filepath: str, model=None) -> None:
 
             ss_report = validate_computed_steady_state(model, result.values)
             eq_results = [r for r in ss_report.results if not r.is_local_var]
+            numerical_failed |= not eq_results or any(
+                not r.is_satisfied for r in eq_results
+            )
             if eq_results:
                 print("\nSteady-state residuals (resid):")
                 for r in eq_results:
@@ -320,14 +334,16 @@ def _run_solve(text: str, filepath: str, model=None) -> None:
                     else:
                         flag = "" if r.is_satisfied else "  <-- nonzero"
                         print(f"  {r.residual:12.3e}  {label}{flag}")
-        except Exception:
-            pass
+        except Exception as e:
+            numerical_failed = True
+            print(f"\nResidual check failed: {e}", file=sys.stderr)
 
         try:
             from .identification import check_identification
 
             identification_diagnostics = check_identification(model, result.values)
             for diagnostic in identification_diagnostics:
+                numerical_failed |= diagnostic.severity == 1
                 severity_str = {
                     1: "ERROR",
                     2: "WARNING",
@@ -344,9 +360,13 @@ def _run_solve(text: str, filepath: str, model=None) -> None:
         except ImportError:
             pass
         except Exception as e:
+            numerical_failed = True
             print(f"\nIdentification check failed: {e}", file=sys.stderr)
     else:
         print(f"Failed: {result.message}", file=sys.stderr)
+        sys.exit(1)
+
+    if numerical_failed:
         sys.exit(1)
 
 

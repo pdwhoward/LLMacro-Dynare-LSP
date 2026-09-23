@@ -16,6 +16,8 @@ Requires sympy (optional dependency). Install with:
 
 from __future__ import annotations
 
+import math
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -114,6 +116,34 @@ class SymbolicReductionResult:
 # ---------------------------------------------------------------------------
 
 
+_MAX_SYMBOLIC_NUMERIC_EXPONENT = 1024.0
+
+
+def _is_oversized_numeric_exponent(node: Any) -> bool:
+    """True when ``node`` is a names-free exponent too large for exact math.
+
+    The exponent is evaluated in double precision (integer literals promoted
+    to floats), which is instantaneous even for ``10**10**8``.
+    """
+    import ast as _ast
+
+    if any(
+        isinstance(child, (_ast.Name, _ast.Call))
+        for child in _ast.walk(node)
+    ):
+        return False
+    try:
+        from .steady_state import _normalize_numeric_expr
+
+        text = _normalize_numeric_expr(_ast.unparse(node))
+        value = float(eval(  # noqa: S307 - names-free numeric AST, no builtins
+            compile(text, "<exponent>", "eval"), {"__builtins__": {}}, {},
+        ))
+    except Exception:
+        return True
+    return not math.isfinite(value) or abs(value) > _MAX_SYMBOLIC_NUMERIC_EXPONENT
+
+
 def _dynare_expr_to_sympy(
     expr_text: str,
     var_symbols: Dict[str, Any],
@@ -193,6 +223,14 @@ def _dynare_expr_to_sympy(
             )
         if isinstance(node, _ast.Name) and node.id.startswith("__"):
             raise ValueError("Private Python names are not supported symbolically")
+        if (
+            isinstance(node, _ast.BinOp)
+            and isinstance(node.op, _ast.Pow)
+            and _is_oversized_numeric_exponent(node.right)
+        ):
+            # sympy evaluates Integer**Integer exactly in C big-int code that
+            # no deadline can interrupt (10**10**8 runs for minutes).
+            raise ValueError("Oversized numeric exponent is not supported symbolically")
         if isinstance(node, _ast.Call):
             if (
                 not isinstance(node.func, _ast.Name)
@@ -519,6 +557,124 @@ def _past(deadline: Optional[float]) -> bool:
     return deadline is not None and time.monotonic() >= deadline
 
 
+class SymbolicDeadlineExceeded(BaseException):
+    """Raised inside a sympy computation when its hard deadline elapses.
+
+    Derives from ``BaseException`` so sympy's many ``except Exception``
+    handlers cannot swallow it.
+    """
+
+
+def _async_exception_setter() -> Optional[Callable[[int, Any], int]]:
+    try:
+        import ctypes
+
+        setter = ctypes.pythonapi.PyThreadState_SetAsyncExc
+        setter.argtypes = [ctypes.c_ulong, ctypes.py_object]
+        setter.restype = ctypes.c_int
+    except Exception:
+        return None
+
+    def _set(thread_id: int, exc: Any) -> int:
+        payload = ctypes.py_object(exc) if exc is not None else ctypes.py_object()
+        return int(setter(thread_id, payload))
+
+    return _set
+
+
+_SET_ASYNC_EXC = _async_exception_setter()
+
+
+def _reset_sympy_global_state() -> None:
+    """Restore sympy's global evaluation flags after an interrupted call.
+
+    An asynchronous interrupt can land inside a context manager's cleanup
+    (e.g. ``evaluate(False)``) and leave the thread-local flags altered.
+    """
+    if not _HAS_SYMPY:
+        return
+    try:
+        from sympy.core.parameters import global_parameters
+
+        global_parameters.evaluate = True
+        global_parameters.distribute = True
+        global_parameters.exp_is_pow = False
+    except Exception:
+        pass
+
+
+def call_with_hard_deadline(
+    fn: Callable[..., Any],
+    deadline: Optional[float],
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    """Run ``fn`` in the calling thread, interrupting it at ``deadline``.
+
+    A single ``sympy.solve`` can run for tens of seconds with no
+    cancellation hook, so the cooperative between-step deadline checks are
+    not enough to honour an interactive time budget.  A watchdog thread
+    raises :class:`SymbolicDeadlineExceeded` asynchronously in the calling
+    thread once ``deadline`` (a ``time.monotonic()`` value) passes.  Pure
+    Python code (all of sympy's solve machinery) is interrupted at the next
+    bytecode boundary; a long single C-level call cannot be, so the bound is
+    best-effort for those.  No process spawn is involved, so the overhead is
+    one short-lived thread.  ``deadline=None`` calls ``fn`` directly.
+    """
+    if deadline is None:
+        return fn(*args, **kwargs)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise SymbolicDeadlineExceeded
+    if _SET_ASYNC_EXC is None:
+        return fn(*args, **kwargs)
+
+    target = threading.get_ident()
+    lock = threading.Lock()
+    done = threading.Event()
+    fired = [False]
+
+    def _watchdog() -> None:
+        if done.wait(remaining):
+            return
+        # Re-deliver a few times in case a bare ``except:`` in library code
+        # swallows the first interrupt.
+        for _attempt in range(200):
+            with lock:
+                if done.is_set():
+                    return
+                fired[0] = True
+                assert _SET_ASYNC_EXC is not None
+                _SET_ASYNC_EXC(target, SymbolicDeadlineExceeded)
+            if done.wait(0.05):
+                return
+
+    watchdog = threading.Thread(
+        target=_watchdog, name="dynare-lsp-symbolic-deadline", daemon=True,
+    )
+    watchdog.start()
+
+    def _stop_watchdog() -> None:
+        # ``done`` is set before taking the lock so the watchdog cannot start
+        # a new injection; taking the lock then waits out one in progress,
+        # and any interrupt queued but not yet delivered is cleared.
+        done.set()
+        with lock:
+            if fired[0]:
+                assert _SET_ASYNC_EXC is not None
+                _SET_ASYNC_EXC(target, None)
+
+    try:
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _stop_watchdog()
+    except SymbolicDeadlineExceeded:
+        _stop_watchdog()
+        _reset_sympy_global_state()
+        raise
+
+
 def reduce_symbolically(
     model: ParsedModel,
     param_values: Optional[Dict[str, float]] = None,
@@ -529,7 +685,41 @@ def reduce_symbolically(
 
     Returns a SymbolicReductionResult with solved variables, unsolved
     equations, and optionally an analytic Jacobian for the numerical solver.
+
+    ``deadline`` (a ``time.monotonic()`` value) is a hard bound: sympy work
+    still running when it passes is interrupted and an empty reduction is
+    returned, so the caller's numeric cascade keeps its share of the budget.
     """
+    try:
+        return call_with_hard_deadline(
+            _reduce_symbolically_impl,
+            deadline,
+            model,
+            param_values,
+            preferred_values,
+            deadline,
+        )
+    except SymbolicDeadlineExceeded:
+        return SymbolicReductionResult(
+            solved_vars={},
+            solved_values={},
+            unsolved_var_names=[v.name for v in model.endogenous],
+            unsolved_equations=[],
+            jacobian_fn=None,
+            scc_blocks=[],
+            symbolic_steps=[
+                "Symbolic reduction stopped: its time budget elapsed; "
+                "falling back to the numerical solver",
+            ],
+        )
+
+
+def _reduce_symbolically_impl(
+    model: ParsedModel,
+    param_values: Optional[Dict[str, float]],
+    preferred_values: Optional[Dict[str, float]],
+    deadline: Optional[float],
+) -> SymbolicReductionResult:
     if not _HAS_SYMPY:
         return SymbolicReductionResult(
             solved_vars={},
@@ -647,7 +837,7 @@ def reduce_symbolically(
                 var_sym = var_symbols[var_name]
 
                 try:
-                    solutions = sympy.solve(eq_sub, var_sym)
+                    solutions = sympy.solve(eq_sub, var_sym, simplify=False)
                     if solutions:
                         # Build known values for solution selection
                         known = {}
@@ -731,7 +921,7 @@ def reduce_symbolically(
                     var_name = next(iter(unsolved_in_eq))
                     var_sym = var_symbols[var_name]
                     try:
-                        solutions = sympy.solve(eq_sub, var_sym)
+                        solutions = sympy.solve(eq_sub, var_sym, simplify=False)
                         if solutions:
                             preferred = (
                                 preferred_values.get(var_name)
@@ -852,7 +1042,9 @@ def reduce_symbolically(
                 try:
                     scc_var_syms = [var_symbols[n] for n in scc if n in var_symbols]
                     solve_eqs = scc_eqs[: len(scc)]
-                    solutions = sympy.solve(solve_eqs, scc_var_syms, dict=True)
+                    solutions = sympy.solve(
+                        solve_eqs, scc_var_syms, dict=True, simplify=False,
+                    )
 
                     if solutions:
                         sol_dict = solutions[0]

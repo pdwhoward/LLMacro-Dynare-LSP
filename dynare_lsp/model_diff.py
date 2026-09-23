@@ -626,6 +626,69 @@ def _levenshtein(a: str, b: str) -> int:
     return prev[-1]
 
 
+def _char_counts(text: str) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for char in text:
+        counts[char] = counts.get(char, 0) + 1
+    return counts
+
+
+def _shared_char_count(left: Dict[str, int], right: Dict[str, int]) -> int:
+    if len(left) > len(right):
+        left, right = right, left
+    return sum(min(count, right.get(char, 0)) for char, count in left.items())
+
+
+def _pairing_distance_limit(max_len: int) -> int:
+    """Largest integer distance ``d`` with ``d / max_len < _EQ_CHANGE_RATIO``."""
+    limit = int(_EQ_CHANGE_RATIO * max_len)
+    while limit >= 0 and limit / max_len >= _EQ_CHANGE_RATIO:
+        limit -= 1
+    return limit
+
+
+def _levenshtein_within(a: str, b: str, limit: int) -> int:
+    """Levenshtein distance, or ``limit + 1`` when it exceeds *limit*.
+
+    Exact unit-cost edit distance (the same value :func:`_levenshtein`
+    returns) computed with Myers' bit-parallel algorithm (Hyyro's global
+    variant): one pass over *b* with a handful of integer operations per
+    character, instead of ``len(a) * len(b)`` interpreted DP cells.
+    """
+    if a == b:
+        return 0
+    if abs(len(a) - len(b)) > limit:
+        return limit + 1
+    if not a or not b:
+        distance = max(len(a), len(b))
+        return distance if distance <= limit else limit + 1
+    if len(a) < len(b):
+        a, b = b, a  # the bit vectors span the longer string
+    full = (1 << len(a)) - 1
+    high = 1 << (len(a) - 1)
+    peq: Dict[str, int] = {}
+    for index, char in enumerate(a):
+        peq[char] = peq.get(char, 0) | (1 << index)
+    pv = full
+    mv = 0
+    score = len(a)
+    for char in b:
+        eq = peq.get(char, 0)
+        xv = eq | mv
+        xh = (((eq & pv) + pv) ^ pv) | eq
+        ph = mv | (~(xh | pv) & full)
+        mh = pv & xh
+        if ph & high:
+            score += 1
+        elif mh & high:
+            score -= 1
+        ph = ((ph << 1) | 1) & full
+        mh = (mh << 1) & full
+        pv = mh | (~(xv | ph) & full)
+        mv = ph & xv
+    return score if score <= limit else limit + 1
+
+
 def _pair_changed_equations(
     removed: List[Equation],
     added: List[Equation],
@@ -641,15 +704,31 @@ def _pair_changed_equations(
         return [], list(removed), list(added)
 
     # Compute every (removed_idx, added_idx, distance, ratio) candidate.
+    # Exact Levenshtein over every removed x added pair is quadratic in the
+    # equation count times quadratic in equation length (tens of seconds for
+    # two large models), so two exact lower bounds reject hopeless pairs
+    # first; the surviving pairs get the same distance as before, so the
+    # pairing result is unchanged.
+    removed_texts = [_normalize_equation(r.text) for r in removed]
+    added_texts = [_normalize_equation(a.text) for a in added]
+    added_counts = [_char_counts(text) for text in added_texts]
     candidates: List[Tuple[float, int, int]] = []
-    for i, r in enumerate(removed):
-        rt = _normalize_equation(r.text)
-        for j, a in enumerate(added):
-            at = _normalize_equation(a.text)
+    for i, rt in enumerate(removed_texts):
+        r_counts = _char_counts(rt)
+        for j, at in enumerate(added_texts):
             max_len = max(len(rt), len(at))
             if max_len == 0:
                 continue
-            d = _levenshtein(rt, at)
+            # Largest distance that still pairs: d / max_len < ratio.
+            limit = _pairing_distance_limit(max_len)
+            if limit < 0 or abs(len(rt) - len(at)) > limit:
+                continue
+            # d >= max_len - LCS >= max_len - (shared character multiset).
+            if max_len - _shared_char_count(r_counts, added_counts[j]) > limit:
+                continue
+            d = _levenshtein_within(rt, at, limit)
+            if d > limit:
+                continue
             ratio = d / max_len
             if ratio < _EQ_CHANGE_RATIO:
                 candidates.append((ratio, i, j))
@@ -784,17 +863,40 @@ def _shock_calibration_map(model: ParsedModel) -> Dict[str, str]:
     from .parser import _strip_non_macro_comments
 
     source = _strip_non_macro_comments(model.original_text or model.text)
-    match = re.search(
-        r"(?<!\w)shocks\s*;(.*?)(?<!\w)end\s*;",
-        source,
-        re.DOTALL | re.IGNORECASE,
-    )
-    if not match:
-        return {}
-
     calibrations: Dict[str, str] = {}
+    # Every ``shocks`` block counts, in file order (Dynare accumulates them),
+    # including blocks with options such as ``shocks(overwrite);``.
+    for match in _SHOCKS_BLOCK_RE.finditer(source):
+        options = [
+            option.strip().lower()
+            for option in (match.group("options") or "").split(",")
+            if option.strip()
+        ]
+        if "overwrite" in options:
+            # ``overwrite`` discards everything set by earlier shocks blocks.
+            calibrations.clear()
+        # Other options (``surprise``, ``learnt_in=...``) describe a distinct
+        # shock set, so keep their targets apart from the plain block's.
+        qualifier = ",".join(option for option in options if option != "overwrite")
+        prefix = f"shocks({qualifier}) " if qualifier else ""
+        _collect_shock_statements(match.group("body"), calibrations, prefix)
+    return calibrations
+
+
+_SHOCKS_BLOCK_RE = re.compile(
+    r"(?<!\w)shocks\s*(?:\((?P<options>[^)]*)\))?\s*;(?P<body>.*?)(?<!\w)end\s*;",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _collect_shock_statements(
+    body: str,
+    calibrations: Dict[str, str],
+    prefix: str = "",
+) -> None:
+    """Add one shocks block's ``var``/``stderr``/``corr`` statements."""
     current_vars: List[str] = []
-    for statement in match.group(1).split(";"):
+    for statement in body.split(";"):
         normalized = _WHITESPACE.sub(" ", statement).strip()
         if not normalized:
             continue
@@ -810,16 +912,16 @@ def _shock_calibration_map(model: ParsedModel) -> Dict[str, str]:
             rhs = var_match.group(2)
             if rhs is not None and names:
                 target = "var " + ",".join(names)
-                calibrations[target] = rhs.strip()
+                calibrations[prefix + target] = rhs.strip()
             continue
 
         stderr_match = re.match(r"stderr\s+(.+)$", normalized, re.IGNORECASE)
         if stderr_match:
             rhs = stderr_match.group(1).strip()
             for name in current_vars:
-                calibrations[f"stderr {name}"] = rhs
+                calibrations[f"{prefix}stderr {name}"] = rhs
             if not current_vars:
-                calibrations["stderr"] = rhs
+                calibrations[prefix + "stderr"] = rhs
             continue
 
         corr_match = re.match(
@@ -832,9 +934,7 @@ def _shock_calibration_map(model: ParsedModel) -> Dict[str, str]:
             rhs = corr_match.group(2)
             if rhs is not None and names:
                 target = "corr " + ",".join(names)
-                calibrations[target] = rhs.strip()
-
-    return calibrations
+                calibrations[prefix + target] = rhs.strip()
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,6 @@
+# Published as .gitattributes in the public Dynare LSP repository.
+# Store text with LF line endings in the repository; binaries stay untouched.
+* text=auto eol=lf
+*.exe binary
+*.vsix binary
+*.png binary

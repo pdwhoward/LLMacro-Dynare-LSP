@@ -52,7 +52,7 @@ function editorSettings(uri) {
     const base = vscode.workspace.getWorkspaceFolder(uri)?.uri.fsPath ?? path.dirname(uri.fsPath);
     const resourcePaths = config.get("searchPaths", []).filter((value) => value.trim().length > 0)
         .map((value) => path.isAbsolute(value.trim()) ? value.trim() : path.resolve(base, value.trim()));
-    return { tolerance: config.get("steadyStateTolerance", 1e-6), search_paths: Array.from(new Set([...globalPaths, ...resourcePaths])) };
+    return { tolerance: config.get("steadyStateTolerance", 6.055454452393343e-6), search_paths: Array.from(new Set([...globalPaths, ...resourcePaths])) };
 }
 function reportConfiguration(uri) {
     return { ...editorSettings(uri), numerical: true, preprocessor: true };

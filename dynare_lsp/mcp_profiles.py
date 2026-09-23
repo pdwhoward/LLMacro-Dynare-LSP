@@ -9,8 +9,8 @@ from typing import Any
 # Closed allowlist, not a name-prefix inference. New capabilities require review
 # before they become available in a restricted server.
 ANALYSIS_TOOLS = frozenset({"dynare_analysis_report", "dynare_validate_patch", "dynare_get_context",
-    "dynare_numerical_evidence", "dynare_environment", "dynare_project_analysis"})
-_TEMP_WRITERS = frozenset({"dynare_analysis_report", "dynare_validate_patch", "dynare_project_analysis"})
+    "dynare_numerical_evidence", "dynare_environment", "dynare_project_analysis", "dynare_preflight"})
+_TEMP_WRITERS = frozenset({"dynare_analysis_report", "dynare_validate_patch", "dynare_project_analysis", "dynare_preflight"})
 
 
 def validate_limits(max_request_bytes: int, max_execution_seconds: int) -> None:
@@ -31,6 +31,32 @@ def bounded_call(function, max_request_bytes: int):
             raise ValueError("Request exceeds the server's configured byte limit")
         from .analysis_service import json_safe
         return json_safe(function(*args, **kwargs))
+    return call
+
+
+def threaded_call(function, max_call_seconds: float):
+    """Run a synchronous tool body in a worker thread with a per-call deadline.
+
+    FastMCP awaits synchronous tools on the event loop, so one slow analysis
+    would block ping, cancellation and every other request on the stdio
+    server. The wrapper keeps the original signature (and therefore the
+    input/output schemas) through functools.wraps. On timeout the worker
+    thread is abandoned (Python threads cannot be killed) and a structured
+    error is returned instead of blocking the transport.
+    """
+    @functools.wraps(function)
+    async def call(*args, **kwargs):
+        import anyio
+        import anyio.to_thread
+
+        with anyio.move_on_after(max_call_seconds) as scope:
+            return await anyio.to_thread.run_sync(
+                functools.partial(function, *args, **kwargs), abandon_on_cancel=True)
+        if scope.cancelled_caught:
+            return {"success": False, "error": "timeout", "checks_passed": False,
+                    "message": f"{function.__name__} exceeded the server's {max_call_seconds:g}s per-call deadline; "
+                               "the result was discarded."}
+        raise RuntimeError("Tool call was cancelled")
     return call
 
 
@@ -73,12 +99,29 @@ def execution_tool(max_execution_seconds: int):
     return dynare_execute_trusted_model
 
 
+def validate_call_seconds(max_call_seconds: int) -> None:
+    if isinstance(max_call_seconds, bool) or not isinstance(max_call_seconds, int) or not 1 <= max_call_seconds <= 3600:
+        raise ValueError("max_call_seconds must be an integer in [1, 3600]")
+
+
 def register_profile(server, profile: str, modules, annotations_type, *,
-                     max_request_bytes: int = 8 * 1024 * 1024, max_execution_seconds: int = 300) -> list[str]:
-    """Register only allowed analysis functions; execution is a separate branch."""
+                     max_request_bytes: int = 8 * 1024 * 1024, max_execution_seconds: int = 300,
+                     max_call_seconds: int | None = None) -> list[str]:
+    """Register only allowed analysis functions; execution is a separate branch.
+
+    With max_call_seconds, every tool body runs in a worker thread under that
+    deadline (trusted execution gets its own timeout plus a grace period).
+    """
     if profile not in {"analysis", "execution"}:
         raise ValueError("profile must be analysis or execution")
     validate_limits(max_request_bytes, max_execution_seconds)
+    if max_call_seconds is not None:
+        validate_call_seconds(max_call_seconds)
+
+    def wrap(function, deadline):
+        bounded = bounded_call(function, max_request_bytes)
+        return bounded if deadline is None else threaded_call(bounded, deadline)
+
     registered = []
     for module in modules:
         function = module.TOOL
@@ -87,21 +130,58 @@ def register_profile(server, profile: str, modules, annotations_type, *,
             continue
         annotations = annotations_type(readOnlyHint=name not in _TEMP_WRITERS,
             destructiveHint=False, idempotentHint=True, openWorldHint=False)
-        server.tool(annotations=annotations)(bounded_call(function, max_request_bytes))
+        server.tool(annotations=annotations)(wrap(function, max_call_seconds))
         registered.append(name)
     if profile == "execution":
         function = execution_tool(max_execution_seconds)
         annotations = annotations_type(readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=True)
-        server.tool(annotations=annotations)(bounded_call(function, max_request_bytes))
+        grace = None if max_call_seconds is None else max(max_call_seconds, max_execution_seconds + 30)
+        server.tool(annotations=annotations)(wrap(function, grace))
         registered.append(function.__name__)
     return registered
 
 
+DEFAULT_MAX_CALL_SECONDS = 120
+
+
+def detach_process_stdin() -> None:
+    """Serve the stdio transport from a private stdin duplicate; children get NUL.
+
+    Tool bodies run in worker threads while the transport thread blocks
+    reading the stdin pipe. On Windows, a subprocess started without an
+    explicit stdin duplicates the process's standard input handle, and
+    duplicating a synchronous pipe with a pending read blocks until that read
+    completes, i.e. until the client's next message. Pointing the standard
+    input handle at the null device keeps child processes (preprocessor,
+    MATLAB) from inheriting, or blocking on, the protocol stream.
+    """
+    import os
+    import sys
+
+    try:
+        private = os.dup(0)
+    except OSError:
+        return
+    null = os.open(os.devnull, os.O_RDONLY)
+    try:
+        os.dup2(null, 0)
+    finally:
+        os.close(null)
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+
+        # os.dup2 does not always update the Win32 standard handle table.
+        ctypes.windll.kernel32.SetStdHandle(-10, msvcrt.get_osfhandle(0))  # STD_INPUT_HANDLE
+    sys.stdin = open(private, "r", encoding="utf-8", errors="strict", closefd=True)
+
+
 def build_server(profile: str = "analysis", *, max_request_bytes: int = 8 * 1024 * 1024,
-                 max_execution_seconds: int = 300):
+                 max_execution_seconds: int = 300, max_call_seconds: int = DEFAULT_MAX_CALL_SECONDS):
     if profile not in {"analysis", "execution"}:
         raise ValueError("profile must be analysis or execution")
     validate_limits(max_request_bytes, max_execution_seconds)
+    validate_call_seconds(max_call_seconds)
     try:
         from mcp.server.fastmcp import FastMCP
         from mcp.types import ToolAnnotations
@@ -112,12 +192,14 @@ def build_server(profile: str = "analysis", *, max_request_bytes: int = 8 * 1024
     if "annotations" not in inspect.signature(server.tool).parameters:
         raise RuntimeError("This MCP SDK does not support tool annotations; upgrade the compatible MCP extra.")
     registered = register_profile(server, profile, features(), ToolAnnotations,
-        max_request_bytes=max_request_bytes, max_execution_seconds=max_execution_seconds)
+        max_request_bytes=max_request_bytes, max_execution_seconds=max_execution_seconds,
+        max_call_seconds=max_call_seconds)
     @server.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False))
     def dynare_profile_policy() -> dict[str, Any]:
         """Inspect this server's enforced catalog and configured input/execution limits."""
         return {"schema_version": "dynare-profile/1", "profile": profile, "tools": registered,
                 "max_request_bytes": max_request_bytes, "max_execution_seconds": max_execution_seconds,
+                "max_call_seconds": max_call_seconds, "tool_execution": "worker_thread",
                 "source_policy": "supplied-only versioned analysis; no legacy tool registration",
                 "matlab_execution_enabled": profile == "execution", "os_sandbox": False}
     return server
@@ -128,9 +210,13 @@ def main(argv=None) -> None:
     parser.add_argument("--profile", choices=("analysis", "execution"), default="analysis")
     parser.add_argument("--max-request-bytes", type=int, default=8 * 1024 * 1024)
     parser.add_argument("--max-execution-seconds", type=int, default=300)
+    parser.add_argument("--max-call-seconds", type=int, default=DEFAULT_MAX_CALL_SECONDS,
+                        help="Per-call deadline for analysis tools (structured timeout error).")
     args = parser.parse_args(argv)
+    detach_process_stdin()
     server = build_server(args.profile, max_request_bytes=args.max_request_bytes,
-                          max_execution_seconds=args.max_execution_seconds)
+                          max_execution_seconds=args.max_execution_seconds,
+                          max_call_seconds=args.max_call_seconds)
     server.run()
 
 

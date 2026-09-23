@@ -15,9 +15,13 @@ model equation and checks that LHS = RHS (residual ≈ 0).
 from __future__ import annotations
 
 import ast
+import copy
+import functools
 import logging
 import math
 import re
+import sys
+from types import CodeType
 from dataclasses import dataclass, field
 from statistics import NormalDist
 from typing import Dict, List, Optional, Tuple
@@ -33,6 +37,12 @@ from .parser import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Dynare's default ``options_.solve_tolf = eps^(1/3)`` (about 6.06e-6): a
+# steady state is accepted when ``max(abs(residual)) <= solve_tolf``
+# (evaluate_steady_state.m / evaluate_steady_state_file.m reject only
+# ``> solve_tolf``).
+DYNARE_SOLVE_TOLF = sys.float_info.epsilon ** (1.0 / 3.0)
 
 
 @dataclass
@@ -425,6 +435,149 @@ def _escape_reserved(name: str) -> str:
     return name
 
 
+_COMPARISON_CHAIN_HINT = re.compile(
+    r"(?:<=|>=|==|!=|<|>)[^<>=!]*(?:<=|>=|==|!=|<|>)",
+)
+
+
+class _LeftAssociateComparisons(ast.NodeTransformer):
+    def visit_Compare(self, node: ast.Compare) -> ast.AST:
+        self.generic_visit(node)
+        if len(node.ops) < 2:
+            return node
+        left: ast.expr = node.left
+        for op, comparator in zip(node.ops, node.comparators):
+            left = ast.Compare(left=left, ops=[op], comparators=[comparator])
+        return left
+
+
+class _DynareNumericSemantics(_LeftAssociateComparisons):
+    """Give a Python expression tree Dynare's numeric semantics.
+
+    * chained comparisons associate to the left (see
+      :func:`_left_assoc_comparisons`);
+    * integer literals become doubles.  Dynare evaluates every literal as a
+      double, while Python integer exponentiation (``10**10**8``) builds an
+      unbounded big int and can hang for minutes.  With floats the same
+      expression overflows immediately (unevaluable) instead.
+    """
+
+    def visit_Constant(self, node: ast.Constant) -> ast.AST:
+        value = node.value
+        if isinstance(value, int) and not isinstance(value, bool):
+            try:
+                converted = float(value)
+            except OverflowError:
+                converted = math.inf
+            return ast.copy_location(ast.Constant(value=converted), node)
+        return node
+
+
+def _left_assoc_comparisons(expr: str) -> str:
+    """Rewrite chained comparisons with Dynare/MATLAB left associativity.
+
+    Dynare parses ``a < b < c`` as ``(a < b) < c`` (the first comparison
+    yields 0/1), whereas Python chains it as ``a < b and b < c``.  Expressions
+    without two comparison operators are returned unchanged.
+    """
+    if not _COMPARISON_CHAIN_HINT.search(expr):
+        return expr
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError:
+        return expr
+    if not any(
+        isinstance(node, ast.Compare) and len(node.ops) > 1
+        for node in ast.walk(tree)
+    ):
+        return expr
+    rewritten = _LeftAssociateComparisons().visit(tree)
+    return ast.unparse(ast.fix_missing_locations(rewritten))
+
+
+_INT_LITERAL_HINT = re.compile(r"(?<![\w.])\d+(?![\w.])")
+
+
+@functools.lru_cache(maxsize=8192)
+def _normalize_numeric_expr(expr: str) -> str:
+    """Source-level form of :class:`_DynareNumericSemantics`.
+
+    Returns an equivalent Python expression string whose integer literals
+    are floats and whose comparisons associate to the left.  Used where an
+    expression string is compiled or spliced into generated code.  Strings
+    that do not parse are returned unchanged (callers reject them later).
+    """
+    if not (_INT_LITERAL_HINT.search(expr) or _COMPARISON_CHAIN_HINT.search(expr)):
+        return expr
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except (SyntaxError, ValueError):
+        return expr
+    rewritten = _DynareNumericSemantics().visit(tree)
+    try:
+        return ast.unparse(ast.fix_missing_locations(rewritten))
+    except Exception:
+        return expr
+
+
+@functools.lru_cache(maxsize=8192)
+def _compile_safe_expr(expr: str) -> Tuple[Optional[CodeType], str]:
+    """AST-validate and compile ``expr`` with Dynare numeric semantics."""
+    if not _validate_ast(expr):
+        return None, f"Unsafe expression rejected: {expr}"
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError as e:
+        return None, f"Syntax error: {e}"
+    except ValueError as e:
+        return None, f"Math error: {e}"
+    tree = ast.fix_missing_locations(_DynareNumericSemantics().visit(tree))
+    try:
+        return compile(tree, "<dynare-expr>", "eval"), ""
+    except (SyntaxError, ValueError, OverflowError) as e:
+        return None, f"Syntax error: {e}"
+
+
+def _float_floor(x):
+    return float(math.floor(x))
+
+
+def _float_ceil(x):
+    return float(math.ceil(x))
+
+
+def _dynare_round(x) -> float:
+    """Dynare/C++ ``round``: halfway cases away from zero, returned as double."""
+    value = float(x)
+    if not math.isfinite(value):
+        return value
+    if value >= 0:
+        return float(math.floor(value + 0.5))
+    return float(math.ceil(value - 0.5))
+
+
+def _unique_endogenous_model(model: ParsedModel) -> ParsedModel:
+    """Return ``model`` with duplicate endogenous declarations collapsed.
+
+    Dynare only warns about ``var y c; var y;`` and keeps one symbol ``y``;
+    numeric code must build its unknown vector from unique names in
+    first-declaration order.  Returns ``model`` itself when there are no
+    duplicates.
+    """
+    seen: set = set()
+    unique = []
+    for declaration in model.endogenous:
+        if declaration.name in seen:
+            continue
+        seen.add(declaration.name)
+        unique.append(declaration)
+    if len(unique) == len(model.endogenous):
+        return model
+    clone = copy.copy(model)
+    clone.endogenous = unique
+    return clone
+
+
 def _escape_expr(expr: str) -> str:
     """Escape Python reserved words in an expression string."""
 
@@ -494,9 +647,9 @@ def _build_eval_env(values: Dict[str, float]) -> dict:
         "asinh": math.asinh,
         "acosh": math.acosh,
         "atanh": math.atanh,
-        "floor": math.floor,
-        "ceil": math.ceil,
-        "round": round,
+        "floor": _float_floor,
+        "ceil": _float_ceil,
+        "round": _dynare_round,
         "min": min,
         "max": max,
         "erf": math.erf,
@@ -576,11 +729,13 @@ def _safe_eval_expr(expr: str, env: dict) -> Tuple[Optional[float], str]:
     Handles complex number results by taking the real part when the
     imaginary component is negligible.
     """
-    if not _validate_ast(expr):
-        logger.debug("Rejected unsafe expression: %s", expr)
-        return None, f"Unsafe expression rejected: {expr}"
+    code, compile_error = _compile_safe_expr(expr)
+    if code is None:
+        if compile_error.startswith("Unsafe"):
+            logger.debug("Rejected unsafe expression: %s", expr)
+        return None, compile_error
     try:
-        result = eval(expr, {"__builtins__": {}}, env)
+        result = eval(code, {"__builtins__": {}}, env)
         # Handle complex results from fractional exponentiation
         if isinstance(result, complex):
             if abs(result.imag) < 1e-10:
@@ -917,7 +1072,7 @@ def _evaluate_equation(
     eq: Equation,
     values: Dict[str, float],
     exogenous_names: set,
-    tolerance: float = 1e-6,
+    tolerance: float = DYNARE_SOLVE_TOLF,
     exogenous_values: Optional[Dict[str, float]] = None,
     protected_names: Optional[set] = None,
     _prebuilt_env: Optional[dict] = None,
@@ -1026,7 +1181,7 @@ def _evaluate_equation(
                 residual=None,
                 error_message="Cannot evaluate expression: no numeric value",
             )
-        is_satisfied = abs(val) < tolerance
+        is_satisfied = abs(val) <= tolerance
         return SteadyStateResult(
             equation=eq,
             residual=val,
@@ -1069,7 +1224,7 @@ def _evaluate_equation(
     # Dynare's solve_tolf is an absolute residual tolerance.  Relative scaling
     # can otherwise accept a materially wrong equation solely because both
     # sides happen to be large.
-    is_satisfied = abs(residual) < tolerance
+    is_satisfied = abs(residual) <= tolerance
 
     return SteadyStateResult(
         equation=eq,
@@ -1134,7 +1289,7 @@ def _pre_evaluate_model_local_variables(
 def validate_computed_steady_state(
     model: ParsedModel,
     computed_values: Dict[str, float],
-    tolerance: float = 1e-6,
+    tolerance: float = DYNARE_SOLVE_TOLF,
     param_overrides: Optional[Dict[str, float]] = None,
 ) -> SteadyStateReport:
     """Validate externally-computed values against model equations.
@@ -1200,13 +1355,51 @@ def _command_scan_text(model: ParsedModel) -> str:
     return _mask_string_literals(_strip_comments(model.text or ""))
 
 
-def _initval_is_followed_by_steady(model: ParsedModel) -> bool:
-    """Return whether the latest ``initval`` feeds a later ``steady`` call.
+# Commands after which Dynare computes the steady state from the current
+# ``oo_.steady_state`` (i.e. the ``initval`` values act as solver guesses):
+# ``steady`` directly, and every command that solves the first-order model
+# through resol.m -> evaluate_steady_state (stoch_simul, check, estimation,
+# ...).  Perfect-foresight commands are handled separately by
+# ``_is_deterministic_transition`` because there ``initval`` is the initial
+# condition of a transition path.
+_STEADY_STATE_COMPUTING_COMMANDS = (
+    "steady",
+    "stoch_simul",
+    "check",
+    "estimation",
+    "osr",
+    "ramsey_policy",
+    "discretionary_policy",
+    "identification",
+    "dynare_sensitivity",
+    "calib_smoother",
+    "model_diagnostics",
+    "evaluate_planner_objective",
+    "method_of_moments",
+    "occbin_solver",
+    "forecast",
+    "conditional_forecast",
+    "shock_decomposition",
+    "realtime_shock_decomposition",
+)
+_STEADY_STATE_COMPUTING_COMMAND_RE = re.compile(
+    r"(?:^|(?<=;))\s*("
+    + "|".join(_STEADY_STATE_COMPUTING_COMMANDS)
+    + r")(?![\w.])\s*(?:\([^;]*?\))?[^;=]*;",
+    re.IGNORECASE | re.MULTILINE,
+)
 
-    In that ordering Dynare uses the ``initval`` values as starting guesses for
-    its nonlinear steady-state solver.  They are not themselves a candidate
-    steady state, so validating them before the solver runs produces false
-    residual warnings.
+
+def _initval_is_followed_by_steady(model: ParsedModel) -> bool:
+    """Return whether the latest ``initval`` feeds a later steady-state solve.
+
+    Dynare uses the ``initval`` values as starting guesses for its nonlinear
+    steady-state solver both for an explicit ``steady;`` and for every
+    command that solves the model through resol.m (``stoch_simul``,
+    ``check``, ``estimation``, ...), which calls evaluate_steady_state on
+    the current values.  They are not themselves a candidate steady state,
+    so validating them before the solver runs produces false residual
+    warnings.
     """
     if not model.initval_entries:
         return False
@@ -1216,12 +1409,8 @@ def _initval_is_followed_by_steady(model: ParsedModel) -> bool:
         for entry in model.initval_entries
     )
     command_text = _command_scan_text(model)
-    for match in re.finditer(
-        r"(?<!\w)steady\s*(?:\([^;\)]*\))?\s*;",
-        command_text,
-        re.IGNORECASE,
-    ):
-        position = _offset_to_position(command_text, match.start())
+    for match in _STEADY_STATE_COMPUTING_COMMAND_RE.finditer(command_text):
+        position = _offset_to_position(command_text, match.start(1))
         if (position.line, position.character) > last_entry:
             return True
     return False
@@ -1261,7 +1450,7 @@ def _steady_command_uses_nocheck(model: ParsedModel) -> bool:
 
 def validate_steady_state(
     model: ParsedModel,
-    tolerance: float = 1e-6,
+    tolerance: float = DYNARE_SOLVE_TOLF,
     param_overrides: Optional[Dict[str, float]] = None,
 ) -> Optional[SteadyStateReport]:
     """Validate that steady state values satisfy the model equations.

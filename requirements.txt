@@ -1,5 +1,5 @@
-pygls>=1.0.0
-lsprotocol>=2023.0.0
+pygls>=2.0.0,<3
+lsprotocol>=2025.0.0
 numpy>=1.20.0
 scipy>=1.7.0
 sympy>=1.12

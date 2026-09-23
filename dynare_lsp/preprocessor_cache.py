@@ -6,6 +6,7 @@ import copy
 import functools
 import hashlib
 import os
+import re
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -36,10 +37,19 @@ def preprocessor_cache_info() -> dict:
         }
 
 
+_INCLUDE_DIRECTIVE_LINE = re.compile(
+    r"^[ \t]*@#[ \t]*include(?![A-Za-z0-9_])", re.IGNORECASE | re.MULTILINE
+)
+
+
 def _active_includepaths(
-    module, text: str, base_dir: Optional[str]
+    module, text: str, working_dir: Optional[str]
 ) -> Optional[list[str]]:
-    """Return literal search paths, or None when dependency resolution is unsafe."""
+    """Return literal search paths, or None when dependency resolution is unsafe.
+
+    Dynare opens a relative ``@#includepath`` against its working directory
+    (the entry model's folder), never against the declaring file.
+    """
     scan = module._strip_non_macro_comments(text)
     _defines, active_lines, _line_defines = module._macro_branch_state(scan)
     scan = module._mask_inactive_macro_lines(scan, active_lines)
@@ -63,15 +73,34 @@ def _active_includepaths(
             value = raw.strip().strip("'\"")
             if not value:
                 continue
-            if not os.path.isabs(value) and base_dir:
-                value = os.path.join(base_dir, value)
+            if not os.path.isabs(value):
+                if not working_dir:
+                    # Relative to an ephemeral temp working directory.
+                    return None
+                value = os.path.join(working_dir, value)
             paths.append(os.path.abspath(value))
     return paths
 
 
+def _dynare_candidates(
+    include: str, working_dir: Optional[str], search_paths: list[str]
+) -> list[str]:
+    """Paths Dynare tries for ``@#include include``, in Dynare's order.
+
+    ``macro/Directives.cc``: the name as given (relative to the working
+    directory), then ``dir / name`` for each search directory.  The folder
+    of the including file is never consulted.
+    """
+    if os.path.isabs(include):
+        return [include]
+    candidates = [os.path.join(working_dir, include)] if working_dir else []
+    candidates.extend(os.path.join(path, include) for path in search_paths)
+    return candidates
+
+
 def _cache_key(module, text: str, executable: str, source_dir: Optional[str]):
     digest = hashlib.sha256()
-    digest.update(b"dynare-lsp-preprocessor-cache-v1\0")
+    digest.update(b"dynare-lsp-preprocessor-cache-v2\0")
     try:
         stat = os.stat(executable)
         identity = (os.path.realpath(executable), stat.st_mtime_ns, stat.st_size)
@@ -83,53 +112,47 @@ def _cache_key(module, text: str, executable: str, source_dir: Optional[str]):
     digest.update(repr(root).encode("utf-8", "surrogatepass"))
     digest.update(text.encode("utf-8", "surrogatepass"))
     seen = set()
+    # Dynare keeps ONE search-path list for the whole run: an @#includepath
+    # inside an included file also applies to every later include.
+    search_paths: list[str] = []
 
-    def walk(content: str, base_dir: Optional[str], inherited: list[str]) -> bool:
+    def walk(content: str) -> bool:
         # Branch state is shared across includes in Dynare. A per-file scan
         # cannot prove which conditional dependencies are active, so cache only
         # straight-line literal include graphs until that context is available.
-        directives = module._parse_macro_directives(
-            module._strip_non_macro_comments(content)
-        )
+        stripped = module._strip_non_macro_comments(content)
+        directives = module._parse_macro_directives(stripped)
         if any(
             directive.kind in {"if", "ifdef", "ifndef", "elseif", "else", "for"}
             for directive in directives
         ):
             return False
-        for directive in directives:
-            if directive.kind != "include":
-                continue
-            argument = (directive.argument or "").strip()
-            if (
-                len(argument) < 2
-                or argument[0] not in {"'", '"'}
-                or argument[-1] != argument[0]
-                or argument[0] in argument[1:-1]
-                or "@{" in argument
-            ):
-                return False
-        search_paths = list(inherited)
-        declared_paths = _active_includepaths(module, content, base_dir)
+        includes = list(module._active_include_paths(content))
+        # An include the literal parser skipped (``@#include FILE`` or a
+        # string expression) names a file this fingerprint cannot see.
+        if len(_INCLUDE_DIRECTIVE_LINE.findall(stripped)) > len(includes):
+            return False
+        declared_paths = _active_includepaths(module, content, root)
         if declared_paths is None:
             return False
         for path in declared_paths:
             if path not in search_paths:
                 search_paths.append(path)
-        for raw in module._active_include_paths(content):
+            # Dynare rejects an @#includepath that is not a directory.
+            digest.update(b"includepath\0")
+            digest.update(repr((path, os.path.isdir(path))).encode("utf-8", "surrogatepass"))
+        for raw in includes:
             include = raw.strip().strip("'\"")
             if not include:
                 continue
             if "@{" in include:
                 return False
-            candidates = []
-            if os.path.isabs(include):
-                candidates.append(include)
-            else:
-                if base_dir:
-                    candidates.append(os.path.join(base_dir, include))
-                candidates.extend(os.path.join(path, include) for path in search_paths)
             candidate = next(
-                (os.path.abspath(path) for path in candidates if os.path.isfile(path)),
+                (
+                    os.path.abspath(path)
+                    for path in _dynare_candidates(include, root, search_paths)
+                    if os.path.isfile(path)
+                ),
                 None,
             )
             if candidate is None:
@@ -146,11 +169,11 @@ def _cache_key(module, text: str, executable: str, source_dir: Optional[str]):
             digest.update(canonical.encode("utf-8", "surrogatepass"))
             digest.update(hashlib.sha256(data).digest())
             nested = data.decode("utf-8-sig", errors="replace")
-            if not walk(nested, os.path.dirname(candidate), search_paths):
+            if not walk(nested):
                 return False
         return True
 
-    if not walk(text, root, []):
+    if not walk(text):
         return None
     return digest.hexdigest()
 

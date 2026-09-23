@@ -11,7 +11,7 @@ adds Dynare's numerical classification consistently to CLI, LSP, and MCP users.
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Any, Dict, List, Optional, Tuple, cast
+from typing import Dict, List, Optional, Tuple
 
 DEFAULT_QZ_ZERO_THRESHOLD = 1e-6
 DEFAULT_BOUNDARY_TOL = 1e-5
@@ -28,10 +28,10 @@ def _qz_evidence(
     """Return (singular_0_over_0, qz_criterium, near-boundary roots)."""
     try:
         import numpy as np
-        from scipy.linalg import ordqz
 
         from . import bk_check as bk
 
+        model = bk._unique_endogenous_model(model)
         timing = bk._extract_variable_timing(model)
         endo_names = [item.name for item in model.endogenous]
         n_endo = len(endo_names)
@@ -78,21 +78,15 @@ def _qz_evidence(
             static_indices,
         )
         qz_criterium = 1.0 + unit_root_tol
+        max_dim = bk._max_pencil_dimension()
+        if max_dim > 0 and a.shape[0] > max_dim:
+            return None
+        alpha, beta, _w, _sdim = bk.dynare_ordered_qz(a, b, qz_criterium)
 
-        def explosive(alpha, beta):
-            return np.abs(alpha) > qz_criterium * np.abs(beta)
-
-        if a.shape[0] == 0:
-            alpha = np.array([], dtype=complex)
-            beta = np.array([], dtype=complex)
-        else:
-            _aa, _bb, alpha, beta, _q, _z = cast(Any, ordqz)(
-                a, b, sort=explosive, output="complex"
-            )
-
+        # mjdgges: any(abs(alpha_r) <= zhreshold & abs(beta) <= zhreshold)
         singular = any(
-            abs(complex(av)) < qz_zero_threshold
-            and abs(complex(bv)) < qz_zero_threshold
+            abs(complex(av).real) <= qz_zero_threshold
+            and abs(complex(bv)) <= qz_zero_threshold
             for av, bv in zip(alpha, beta)
         )
         near: List[complex] = []
@@ -124,12 +118,18 @@ def install() -> None:
     def check_blanchard_kahn(
         model,
         ss_values,
-        unit_root_tol: float = 1e-6,
+        unit_root_tol: Optional[float] = None,
         *,
         qz_zero_threshold: float = DEFAULT_QZ_ZERO_THRESHOLD,
         boundary_tol: float = DEFAULT_BOUNDARY_TOL,
         _allow_auxiliary_transform: bool = True,
     ):
+        if unit_root_tol is None:
+            user_criterium = bk.user_qz_criterium(model)
+            unit_root_tol = (
+                user_criterium if user_criterium is not None
+                else bk.DYNARE_DEFAULT_QZ_CRITERIUM
+            ) - 1.0
         result = original_check(
             model,
             ss_values,

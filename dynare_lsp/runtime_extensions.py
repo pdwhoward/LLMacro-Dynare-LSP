@@ -15,6 +15,7 @@ def after_module_load(fullname: str, module: ModuleType) -> None:
         from .semantic_delta import install as install_semantic_delta
         from .semantic_index import install as install_semantic_index
         from .analysis_api import register_lsp
+        from .validation_guard import install as install_validation_guard
 
         install_incremental(module)
         install_diagnostic_tiers(module)
@@ -23,6 +24,8 @@ def after_module_load(fullname: str, module: ModuleType) -> None:
         install_semantic_delta(module)
         install_server(module)
         register_lsp(module)
+        # Wrap the final handlers, including both fast and full validation.
+        install_validation_guard(module)
         if runtime_dispatch.document_change_handler is not None:
             setattr(module, "did_change", runtime_dispatch.document_change_handler)
     elif fullname.endswith(".preprocessor"):

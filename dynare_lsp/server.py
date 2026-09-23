@@ -23,6 +23,7 @@ import re
 import shutil
 import tempfile
 import threading
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -57,6 +58,11 @@ from .parser import (
     _parse_initval_block,
     _strip_comments,
 )
+from .incremental import (
+    LSP_LINE_BREAK_RE,
+    install_lsp_line_splitter,
+    split_lsp_lines,
+)
 from .diagnostics import (
     Diagnostic as DDiag,
     Severity,
@@ -65,6 +71,7 @@ from .diagnostics import (
     _reserved_identifier_reason,
 )
 from . import explain as _explain_module
+from .steady_state import DYNARE_SOLVE_TOLF
 from .workspace import WorkspaceIndex, _normalize_uri
 
 logger = logging.getLogger(__name__)
@@ -107,9 +114,12 @@ if TYPE_CHECKING:
 
 server = LanguageServer(
     "dynare-language-server",
-    "v0.4.0",
+    "v0.5.0",
     text_document_sync_kind=lsp.TextDocumentSyncKind.Full,
 )
+# pygls must split document lines on CR/LF only, exactly like the client and
+# like this server's own incremental text tracker.
+install_lsp_line_splitter()
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +498,10 @@ _document_generations: dict[str, int] = {}
 # Cache diagnostics for code actions
 _document_diagnostics: dict[str, List[DDiag]] = {}
 
+# (generation, text) of the newest committed full validation.  didSave skips
+# re-analysis (and keeps solver/BK/inlay results) when it is still current.
+_document_full_validations: dict[str, Tuple[int, str]] = {}
+
 # Cache solver results for display in hover/inlay hints
 _document_solver_results: dict[str, "SolverResult"] = {}
 
@@ -525,7 +539,7 @@ _solve_generations: dict[str, int] = {}
 _preprocess_executor = ThreadPoolExecutor(max_workers=1)
 _pending_preprocess: dict[str, threading.Timer] = {}
 _preprocessor_path: Optional[str] = None
-_steady_state_tolerance: float = 1e-6
+_steady_state_tolerance: float = DYNARE_SOLVE_TOLF
 # Indent unit used by the document formatter.  Default is a tab; the
 # ``dynare.formatIndent`` setting may override it ("tab" or a space count).
 _format_indent_unit: str = "\t"
@@ -744,7 +758,10 @@ def _validate_document(uri: str, text: str) -> None:
         # Invalidate a timer callback or executor job that was scheduled for
         # the prior parse before the replacement solve is debounced below.
         _solve_generations[uri] = _solve_generations.get(uri, 0) + 1
-        _document_models.pop(uri, None)
+        # Keep the previous parsed model until the new one is committed so
+        # hover/semantic tokens stay populated while a large model is being
+        # re-analysed.  Background jobs are still fenced by the generation
+        # bump above; every derived cache is cleared below.
         previous_solver_result = _document_solver_results.pop(uri, None)
         if previous_solver_result is not None and getattr(
             previous_solver_result, "success", False
@@ -895,6 +912,7 @@ def _validate_document(uri: str, text: str) -> None:
             _document_models[uri] = model
             _document_diagnostics[uri] = diagnostics
             _document_ss_reports[uri] = ss_report
+            _document_full_validations[uri] = (generation, text)
     except Exception as e:
         logger.exception("Error analyzing document %s", uri)
         diagnostics = [
@@ -908,8 +926,11 @@ def _validate_document(uri: str, text: str) -> None:
         with _state_lock:
             if _document_generations.get(uri, 0) != generation:
                 return
+            # No model describes this text; do not serve the previous one.
+            _document_models.pop(uri, None)
             _document_diagnostics[uri] = diagnostics
             _document_ss_reports[uri] = None
+            _document_full_validations[uri] = (generation, text)
 
     lsp_diagnostics = [_to_lsp_diagnostic(d, text) for d in diagnostics]
     _publish_diagnostics_if_current(uri, lsp_diagnostics, generation)
@@ -1449,8 +1470,26 @@ def _schedule_preprocess(uri: str) -> None:
 def did_save(params: lsp.DidSaveTextDocumentParams) -> None:
     """Re-validate on save and trigger preprocessor."""
     uri = params.text_document.uri
+    # A still-pending debounced full validation (diagnostic tiers) would run
+    # after the preprocessor is scheduled below, bump the generation, and make
+    # the preprocessor result stale.  Cancel it; this handler does its work.
+    cancel_pending_validation = globals().get("_cancel_pending_validation")
+    if cancel_pending_validation is not None:
+        cancel_pending_validation(uri)
     doc = server.workspace.get_text_document(uri)
-    _validate_document(uri, doc.source)
+    text = doc.source
+    with _state_lock:
+        fully_validated = _document_full_validations.get(uri) == (
+            _document_generations.get(uri, 0),
+            text,
+        )
+    if not fully_validated:
+        # Same follow-up as a completed full validation: re-solve (validation
+        # clears solver/BK/inlay results) and refresh dependent documents.
+        # When the current text is already fully analysed, keep those results.
+        _validate_document(uri, text)
+        _schedule_solve(uri)
+        _revalidate_cached_documents(schedule_solve=True, exclude_uri=uri)
     _schedule_preprocess(uri)
 
 
@@ -1472,6 +1511,7 @@ def did_close(params: lsp.DidCloseTextDocumentParams) -> None:
         _solve_generations[uri] = _solve_generations.get(uri, 0) + 1
         _document_models.pop(uri, None)
         _document_diagnostics.pop(uri, None)
+        _document_full_validations.pop(uri, None)
         _document_solver_results.pop(uri, None)
         _document_warm_start_results.pop(uri, None)
         _document_bk_results.pop(uri, None)
@@ -2888,9 +2928,7 @@ def _determine_context(lines: List[str], pos: lsp.Position) -> str:
     def _blank(match: re.Match) -> str:
         return re.sub(r"\S", " ", match.group(0))
 
-    masked = _STRING_LITERAL_RE.sub(_blank, prefix)
-    masked = _BLOCK_COMMENT_RE.sub(_blank, masked)
-    masked = _LINE_COMMENT_RE.sub(_blank, masked)
+    masked = _mask_comments_preserving_layout(prefix, mask_strings=True)
     masked = re.sub(r"(?m)^[ \t]*@\#.*$", _blank, masked)
 
     for match in token_re.finditer(masked):
@@ -2923,9 +2961,7 @@ def _command_option_context(lines: List[str], pos: lsp.Position) -> Optional[str
     def _blank(match: re.Match) -> str:
         return re.sub(r"\S", " ", match.group(0))
 
-    masked = _STRING_LITERAL_RE.sub(_blank, prefix)
-    masked = _BLOCK_COMMENT_RE.sub(_blank, masked)
-    masked = _LINE_COMMENT_RE.sub(_blank, masked)
+    masked = _mask_comments_preserving_layout(prefix, mask_strings=True)
     masked = re.sub(r"(?m)^[ \t]*@\#.*$", _blank, masked)
 
     # Only consider the current (unterminated) statement.
@@ -3528,7 +3564,9 @@ def code_action(params: lsp.CodeActionParams) -> Optional[List[lsp.CodeAction]]:
             if missing_vars and model.steady_state_block_range:
                 # Insert before 'end;' of steady_state_model
                 end_line = model.steady_state_block_range.end.line
-                insert = "\n".join(f"    {v} = 0;" for v in missing_vars[:5]) + "\n"
+                # Insert every missing variable: a partial fix would leave
+                # W042 in place and invite a second, identical quick fix.
+                insert = "\n".join(f"    {v} = 0;" for v in missing_vars) + "\n"
                 insert_pos = lsp.Position(line=end_line, character=0)
                 if model.steady_state_block_range.start.line == end_line:
                     line_text = lines[end_line] if end_line < len(lines) else ""
@@ -3939,15 +3977,12 @@ def _find_declaration_insert(lines: List[str], keyword: str, name: str) -> tuple
     is not found.
     """
 
-    def _mask_declaration_scan_text(text: str) -> str:
-        def _blank(match: re.Match) -> str:
-            return " " * (match.end() - match.start())
-
-        masked = re.sub(r'"[^"\n]*"|\'[^\'\n]*\'', _blank, text)
-        masked = re.sub(r"/\*.*?\*/", _blank, masked, flags=re.DOTALL)
-        return re.sub(r"(?://|%).*$", "", masked, flags=re.MULTILINE)
-
-    masked_lines = _mask_declaration_scan_text("\n".join(lines)).split("\n")
+    # Blank comments and strings while keeping every line break, so
+    # ``masked_lines[i]`` is always the masked form of ``lines[i]``: a
+    # multi-line header comment must not shift the lines that follow it.
+    masked_lines = _mask_comments_preserving_layout(
+        "\n".join(lines), mask_strings=True
+    ).split("\n")
     block_depth = 0
     block_keywords = {"model", "steady_state_model", "initval", "endval", "shocks"}
 
@@ -4447,8 +4482,41 @@ def _uri_from_command_args(args) -> Optional[str]:
     return uri if isinstance(uri, str) else None
 
 
+def _open_text_document(uri: str) -> Optional[Any]:
+    """Return the client's open document for *uri*, or ``None``.
+
+    Matches the exact URI first, then by normalized URI, so a
+    ``file:///C:/dir/x.inc`` workspace key finds a VS Code-style
+    ``file:///c%3A/dir/x.inc`` buffer.  Unlike pygls' ``get_text_document``
+    this never fabricates a disk-backed document for a closed file.
+    """
+    try:
+        documents = server.workspace.text_documents
+    except Exception:
+        return None
+    if not isinstance(documents, Mapping):
+        return None
+    document = documents.get(uri)
+    if document is not None:
+        return document
+    try:
+        target_key = _normalize_uri(uri)
+    except Exception:
+        return None
+    for known_uri, known_document in list(documents.items()):
+        try:
+            if _normalize_uri(known_uri) == target_key:
+                return known_document
+        except Exception:
+            continue
+    return None
+
+
 def _command_document_text(uri: str) -> Optional[str]:
-    """Best-effort current text of *uri* (live document, else cached model)."""
+    """Best-effort current text of *uri* (open buffer, disk, else cached model)."""
+    open_document = _open_text_document(uri)
+    if open_document is not None:
+        return open_document.source
     try:
         return server.workspace.get_text_document(uri).source
     except Exception:
@@ -5595,13 +5663,13 @@ def _gather_all_diagnostics(uri: str) -> List[lsp.Diagnostic]:
     return [_to_lsp_diagnostic(d, source_text) for d in all_diags]
 
 
-@server.feature(
-    lsp.TEXT_DOCUMENT_DIAGNOSTIC,
-    lsp.DiagnosticOptions(
-        inter_file_dependencies=True,
-        workspace_diagnostics=True,
-    ),
-)
+# Pull diagnostics are deliberately NOT registered as LSP features.  The
+# server pushes ``textDocument/publishDiagnostics`` after every validation,
+# solve, and preprocessor run.  Advertising ``diagnosticProvider`` as well
+# makes vscode-languageclient 9 keep a second, separate diagnostic collection
+# (every finding shown twice) whose pulled snapshot is never refreshed when a
+# background solve or preprocessor run completes.  ``diagnostic_pull`` and
+# ``workspace_diagnostic`` stay available as in-process helpers.
 def diagnostic_pull(
     params: lsp.DocumentDiagnosticParams,
 ) -> lsp.RelatedFullDocumentDiagnosticReport:
@@ -5669,12 +5737,10 @@ def document_link(
 # Locations; DocumentHighlight returns the same ranges with Read kind;
 # Rename emits a WorkspaceEdit replacing each occurrence with the new name.
 
-# Comment-stripping pattern shared across symbol-reference scans. We strip
-# // line comments, % line comments (Matlab-style, which Dynare also
-# accepts), and /* */ block comments before searching so an occurrence
-# inside a comment is not treated as a real reference or renamed.
-_LINE_COMMENT_RE = re.compile(r"(?://|%).*?$", re.MULTILINE)
-_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.DOTALL)
+# Symbol-reference scans blank // line comments, % line comments
+# (Matlab-style, which Dynare also accepts), and /* */ block comments with
+# ``_mask_comments_preserving_layout`` (below) so an occurrence inside a
+# comment is not treated as a real reference or renamed.
 
 # Additional non-identifier zones that must be masked before reference /
 # rename scans: ``"..."`` and ``'...'`` string literals (used by
@@ -5691,6 +5757,80 @@ _TAG_ATTRIBUTE_KEY_RE = re.compile(r"\b(?:name|mcp)\b(?=\s*=)", re.IGNORECASE)
 _MACRO_DIRECTIVE_LINE_RE = re.compile(r"^[ \t]*@\#[^\n]*(?:\n|$)", re.MULTILINE)
 _MACRO_INTERPOLATION_RE = re.compile(r"@\{[A-Za-z_][A-Za-z0-9_]*\}")
 _ON_THE_FLY_KIND_MARKERS = frozenset({"e", "x", "p"})
+
+_COMMENT_OR_STRING_START_RE = re.compile(r"//|/\*|%|[\"']")
+_LINE_BREAK_CHAR_RE = re.compile(r"[\r\n]")
+_NON_WHITESPACE_RE = re.compile(r"\S")
+
+
+def _mask_comments_preserving_layout(text: str, *, mask_strings: bool = False) -> str:
+    """Blank comments (and optionally strings) in one left-to-right scan.
+
+    Comment and string openers are recognised in source order, so a ``/*``
+    inside a ``//`` or ``%`` line comment (or inside a quoted tag) does not open
+    a block comment, and a ``//`` inside a string is not a comment.  Masked
+    characters become spaces while whitespace -- in particular every line
+    break -- is kept, so offsets, line numbers, and columns are unchanged.
+    Quotes without a closing quote on the same line are ordinary characters,
+    and an unterminated ``/*`` comments out the rest of the text, as in
+    Dynare's lexer.
+    """
+    out: List[str] = []
+    emitted = 0
+    cursor = 0
+    length = len(text)
+    while True:
+        match = _COMMENT_OR_STRING_START_RE.search(text, cursor)
+        if match is None:
+            break
+        start = match.start()
+        token = match.group(0)
+        if token in ('"', "'"):
+            close = text.find(token, start + 1)
+            line_break = _LINE_BREAK_CHAR_RE.search(text, start + 1)
+            if close == -1 or (line_break is not None and line_break.start() < close):
+                cursor = start + 1
+                continue
+            end = close + 1
+            if not mask_strings:
+                cursor = end
+                continue
+        elif token == "/*":
+            close = text.find("*/", start + 2)
+            end = length if close == -1 else close + 2
+        else:
+            line_break = _LINE_BREAK_CHAR_RE.search(text, start)
+            end = length if line_break is None else line_break.start()
+        out.append(text[emitted:start])
+        out.append(_NON_WHITESPACE_RE.sub(" ", text[start:end]))
+        emitted = end
+        cursor = end
+    out.append(text[emitted:])
+    return "".join(out)
+
+
+def _mask_reference_scan_text(
+    source: str,
+    *,
+    mask_interpolations: bool = True,
+) -> str:
+    """Mask everything that is not model code for identifier scans.
+
+    Shared by rename/references/highlight/linked editing and semantic tokens:
+    inactive macro branches, comments, non-MCP strings, macro directive lines,
+    and ``@{...}`` interpolations become spaces; layout is preserved.
+    """
+    masked = _mask_inactive_macro_branches(source)
+    masked = _mask_comments_preserving_layout(masked)
+    masked = _mask_strings_preserving_mcp_values(masked)
+
+    def _blank(match: re.Match) -> str:
+        return _NON_WHITESPACE_RE.sub(" ", match.group(0))
+
+    masked = _MACRO_DIRECTIVE_LINE_RE.sub(_blank, masked)
+    if mask_interpolations:
+        masked = _MACRO_INTERPOLATION_RE.sub(_blank, masked)
+    return masked
 
 
 def _is_on_the_fly_kind_marker(source_line: str, start: int, end: int) -> bool:
@@ -5843,6 +5983,75 @@ def _mask_inactive_macro_branches(source: str) -> str:
         return source
 
 
+_OPTION_KEY_FOLLOW_RE = re.compile(r"\s*=(?!=)")
+_STATEMENT_HEAD_RE = re.compile(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+# Keywords that open a statement inside a shocks-style block.  Outside that
+# position (e.g. ``values (sig_e*2);``) the same names can be symbols.
+_SHOCK_BLOCK_KEYWORDS = frozenset({"var", "periods", "values", "stderr", "corr"})
+_SHOCK_BLOCK_OPEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:shocks|mshocks|heteroskedastic_shocks)\s*"
+    r"(?:\([^()]*\))?\s*;"
+)
+_BLOCK_END_RE = re.compile(r"(?<![A-Za-z0-9_])end\s*;")
+
+
+def _statement_start(masked: str, offset: int) -> int:
+    return masked.rfind(";", 0, offset) + 1
+
+
+def _is_command_option_key(masked: str, start: int, end: int) -> bool:
+    """True for ``key`` in ``command(key=value, ...)`` (option names).
+
+    The identifier must be followed by ``=``, directly follow the ``(`` or a
+    top-level ``,`` of the parenthesised option list that immediately
+    follows the statement's leading command name.  Values after ``=`` and
+    model code (``y(-1)``, ``x == y``) are not option keys.
+    """
+    if not _OPTION_KEY_FOLLOW_RE.match(masked, end):
+        return False
+    previous = start - 1
+    while previous >= 0 and masked[previous].isspace():
+        previous -= 1
+    if previous < 0 or masked[previous] not in "(,":
+        return False
+    statement_start = _statement_start(masked, start)
+    head = _STATEMENT_HEAD_RE.match(masked, statement_start)
+    if head is None or head.end() > start:
+        return False
+    depth = 1
+    for char in masked[head.end() : start]:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return False
+    return depth == 1
+
+
+def _shock_block_spans(masked: str) -> List[Tuple[int, int]]:
+    spans: List[Tuple[int, int]] = []
+    for opener in _SHOCK_BLOCK_OPEN_RE.finditer(masked):
+        if masked[_statement_start(masked, opener.start()) : opener.start()].strip():
+            continue
+        end = _BLOCK_END_RE.search(masked, opener.end())
+        spans.append((opener.end(), end.start() if end else len(masked)))
+    return spans
+
+
+def _is_shock_block_keyword(
+    masked: str,
+    start: int,
+    spans: List[Tuple[int, int]],
+) -> bool:
+    """True when *start* is the leading keyword of a shocks-block statement."""
+    for span_start, span_end in spans:
+        if span_start <= start < span_end:
+            statement_start = max(span_start, _statement_start(masked, start))
+            return not masked[statement_start:start].strip()
+    return False
+
+
 def _find_symbol_occurrences(
     source: str,
     name: str,
@@ -5855,20 +6064,11 @@ def _find_symbol_occurrences(
     if not name:
         return []
 
-    # Mask comments + string literals without disturbing line/column positions.
-    # IMPORTANT: mask STRINGS FIRST.  Otherwise a ``//`` or ``%`` inside
-    # a quoted equation tag (e.g. ``[name='a // b']``) gets caught by
-    # the comment mask before the string mask can protect it, and the
-    # rest of the line is blanked away.
-    def _blank(match: re.Match) -> str:
-        return re.sub(r"\S", " ", match.group(0))
-
-    masked = _mask_inactive_macro_branches(source)
-    masked = _mask_strings_preserving_mcp_values(masked)
-    masked = _BLOCK_COMMENT_RE.sub(_blank, masked)
-    masked = _MACRO_DIRECTIVE_LINE_RE.sub(_blank, masked)
-    masked = _MACRO_INTERPOLATION_RE.sub(_blank, masked)
-    masked = _LINE_COMMENT_RE.sub(_blank, masked)
+    # Mask comments + string literals without disturbing line/column
+    # positions.  One left-to-right scan decides comment vs string, so a
+    # ``//`` inside a quoted tag is not a comment and a ``/*`` inside a line
+    # comment does not hide the code that follows it.
+    masked = _mask_reference_scan_text(source)
 
     pattern = re.compile(rf"\b{re.escape(name)}\b")
     occurrences: List[DRange] = []
@@ -5881,16 +6081,22 @@ def _find_symbol_occurrences(
     # counts).  Bisect against this list to map a match offset to a
     # line index in O(log n).
     line_starts: List[int] = [0]
-    for i, ch in enumerate(masked):
-        if ch == "\n":
-            line_starts.append(i + 1)
+    line_starts.extend(match.end() for match in LSP_LINE_BREAK_RE.finditer(masked))
 
     import bisect as _bisect
 
-    source_lines = source.split("\n")
+    source_lines = split_lsp_lines(source)
+    shock_spans: Optional[List[Tuple[int, int]]] = None
     for m in pattern.finditer(masked):
         start = m.start()
         end = m.end()
+        if _is_command_option_key(masked, start, end):
+            continue
+        if name in _SHOCK_BLOCK_KEYWORDS:
+            if shock_spans is None:
+                shock_spans = _shock_block_spans(masked)
+            if _is_shock_block_keyword(masked, start, shock_spans):
+                continue
         # bisect_right gives insertion point; subtract one to get the
         # line whose start is <= start.
         line_idx = _bisect.bisect_right(line_starts, start) - 1
@@ -7334,7 +7540,7 @@ def on_type_formatting(
 
 def _full_document_edit(old_text: str, new_text: str) -> lsp.TextEdit:
     """A single TextEdit replacing the whole document."""
-    lines = old_text.split("\n")
+    lines = split_lsp_lines(old_text)
     last = lines[-1]
     return lsp.TextEdit(
         range=lsp.Range(
@@ -7501,7 +7707,6 @@ def linked_editing_range(
 # ---------------------------------------------------------------------------
 
 
-@server.feature(lsp.WORKSPACE_DIAGNOSTIC)
 def workspace_diagnostic(
     params: lsp.WorkspaceDiagnosticParams,
 ) -> lsp.WorkspaceDiagnosticReport:
@@ -7890,7 +8095,7 @@ def _semantic_token_tuples(uri: str) -> List[tuple]:
         else None
     )
     if local_scope is None and open_include_kind == "model":
-        lines = source.split("\n")
+        lines = split_lsp_lines(source)
         end_line = max(len(lines) - 1, 0)
         end_char = len(lines[end_line]) if lines else 0
         local_scope = DRange(DPos(0, 0), DPos(end_line, end_char))
@@ -7902,17 +8107,7 @@ def _semantic_token_tuples(uri: str) -> List[tuple]:
     # them aren't classified.  Preserve the expression part of MCP tags,
     # which Dynare treats as model code even though it is quoted.
     # _mask_strings_preserving_mcp_values applies _STRING_LITERAL_RE.
-    def _blank_match(m: re.Match) -> str:
-        return re.sub(r"\S", " ", m.group(0))
-
-    # Mask strings first so embedded ``//`` / ``%`` inside an equation
-    # tag don't trigger comment-line blanking that wipes the rest of
-    # the line.
-    masked = _mask_inactive_macro_branches(source)
-    masked = _mask_strings_preserving_mcp_values(masked)
-    masked = _BLOCK_COMMENT_RE.sub(_blank_match, masked)
-    masked = _MACRO_DIRECTIVE_LINE_RE.sub(_blank_match, masked)
-    masked = _LINE_COMMENT_RE.sub(_blank_match, masked)
+    masked = _mask_reference_scan_text(source, mask_interpolations=False)
 
     type_endo = 0
     type_exo = 1
@@ -7938,8 +8133,8 @@ def _semantic_token_tuples(uri: str) -> List[tuple]:
             decl_starts.add((mapped.start.line, mapped.start.character))
 
     tokens: List[tuple] = []
-    source_lines = source.split("\n")
-    for line_no, line_text in enumerate(masked.split("\n")):
+    source_lines = split_lsp_lines(source)
+    for line_no, line_text in enumerate(split_lsp_lines(masked)):
         source_line = (
             source_lines[line_no] if line_no < len(source_lines) else line_text
         )

@@ -2,7 +2,7 @@
 from __future__ import annotations
 import math
 from typing import Any
-from .analysis_service import json_safe, snapshot, stage
+from .analysis_service import bk_skipped, json_safe, snapshot, stage, unique_endogenous_model
 
 
 def eigenvalue_rows(values, criterion: float | None = None) -> list[dict[str, Any]]:
@@ -83,7 +83,8 @@ def _source_location(snap, equation) -> dict[str, Any]:
 
 
 def inspect_snapshot(snap, values: dict[str, float] | None, max_rows: int) -> dict[str, Any]:
-    model = snap.model
+    # Repeated declarations (Dynare warns only) are one unknown each.
+    model = unique_endogenous_model(snap.model)
     names = [item.name for item in model.endogenous]
     equations = list(model.static_model_equations())
     output = {name: stage("not_run") for name in ("steady_state", "residuals", "jacobian", "blanchard_kahn")}
@@ -146,7 +147,7 @@ def inspect_snapshot(snap, values: dict[str, float] | None, max_rows: int) -> di
     try:
         from .bk_check import check_blanchard_kahn
         bk = check_blanchard_kahn(model, values)
-        skipped = "check skipped" in (bk.message or "").lower()
+        skipped = bk_skipped(bk)
         criterion = getattr(bk, "qz_criterium", None)
         eigenvalues = eigenvalue_rows(bk.eigenvalues, criterion)
         output["blanchard_kahn"] = stage("unsupported" if skipped else "passed" if bk.satisfied else "failed",

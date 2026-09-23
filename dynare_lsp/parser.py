@@ -614,7 +614,12 @@ def _strip_comments(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 _STRING_LITERAL_STRUCTURAL = r"(?:'[^'\n]*'|\"[^\"\n]*\")"
-_NON_END_TOKEN = rf"(?:{_STRING_LITERAL_STRUCTURAL}|(?!(?<!\w)end\s*;).)"
+# Atomic group: a quote that opens a same-line string literal is always
+# consumed as the whole literal, so each character has exactly one way to be
+# matched.  The previous alternation let a string be matched either as a
+# literal or char-by-char, which backtracked exponentially (2^n in the number
+# of string literals) whenever a block had no later ``end;``.
+_NON_END_TOKEN = rf"(?>{_STRING_LITERAL_STRUCTURAL}|(?!(?<!\w)end\s*;).)"
 _OPTION_PARENS_1 = r"\([^()]*\)"
 _OPTION_PARENS_2 = rf"\((?:[^()]|{_OPTION_PARENS_1})*\)"
 _BLOCK_OPTIONS_PATTERN = rf"\((?:[^()]|{_OPTION_PARENS_2})*\)"
@@ -627,6 +632,25 @@ def _mask_string_literals(text: str) -> str:
         lambda m: " " * (m.end() - m.start()),
         text,
     )
+
+
+# Dynare's FLOAT_NUMBER token (DynareFlex.ll, case-insensitive):
+#   ((([0-9]*\.[0-9]+)|([0-9]+\.))([ed][-+]?[0-9]+)?)|([0-9]+[ed][-+]?[0-9]+)
+# Identifier scanners using ``\b[A-Za-z_]\w*`` otherwise split the exponent of
+# ``1.E-3`` / ``1.e1`` / ``3.D0`` off as a bogus identifier (``E``, ``e1``,
+# ``D0``).  The lookbehind stops a match from starting inside an identifier.
+FLOAT_LITERAL_RE = re.compile(
+    r"(?<![A-Za-z0-9_.])"
+    r"(?:(?:\d*\.\d+|\d+\.)(?:[eEdD][-+]?\d+)?|\d+[eEdD][-+]?\d+)"
+    r"(?![A-Za-z0-9_])"
+)
+
+
+def mask_float_literals(text: str) -> str:
+    """Blank Dynare float literals while preserving offsets."""
+    if "." not in text and not re.search(r"\d[eEdD]", text):
+        return text
+    return FLOAT_LITERAL_RE.sub(lambda m: " " * (m.end() - m.start()), text)
 
 
 def _find_block(stripped: str, keyword: str) -> Optional[re.Match]:
@@ -1445,9 +1469,55 @@ def _escape_known_reserved_identifiers(expr: str, known: Dict[str, float]) -> st
 
 
 _NUMERIC_LITERAL_RE = re.compile(r"^\s*-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\s*$")
+# Dynare (like MATLAB/Fortran) accepts ``d``/``D`` as the exponent marker in
+# float literals (``3d0``, ``1.D-3``).  The lookbehind keeps identifiers such
+# as ``a1d2`` untouched; the trailing lookahead keeps ``2dx`` alone.
+_D_EXPONENT_LITERAL_RE = re.compile(
+    r"(?<![\w.])(\d+\.?\d*|\.\d+)[dD]([+-]?\d+)(?![\w.])"
+)
+
+
+def _normalize_dynare_numeric_expr(expr: str) -> str:
+    """Collapse line breaks and map ``d``-exponent literals to ``e`` form.
+
+    Assignments split across lines (``a = 0.3`` then ``+ 0.03;``) are
+    valid Dynare but are not a single Python eval-mode expression, and
+    ``3d0`` is not a Python float literal.
+    """
+    expr = " ".join(expr.split())
+    if "d" in expr or "D" in expr:
+        expr = _D_EXPONENT_LITERAL_RE.sub(r"\1e\2", expr)
+    return expr
+
+
+class _IntLiteralsToFloat(ast.NodeTransformer):
+    """Promote integer literals to floats so ``**`` is IEEE float math.
+
+    Dynare evaluates every numeric literal as a double; Python integer
+    exponentiation (``10**10**8``) instead builds unbounded big ints and can
+    hang the server for minutes.
+    """
+
+    def visit_Constant(self, node: ast.Constant) -> ast.AST:
+        value = node.value
+        if isinstance(value, int) and not isinstance(value, bool):
+            try:
+                return ast.copy_location(ast.Constant(value=float(value)), node)
+            except OverflowError:
+                return ast.copy_location(ast.Constant(value=math.inf), node)
+        return node
+
+
+def _float_floor(x):
+    return float(math.floor(x))
+
+
+def _float_ceil(x):
+    return float(math.ceil(x))
 
 
 def _safe_eval(expr: str, known: Dict[str, float]) -> Optional[float]:
+    expr = _normalize_dynare_numeric_expr(expr)
     # Fast path: pure numeric literals (the common case for Dynare parameter
     # assignments like ``0.99`` or ``1.5e-3``).  Skip the ``^``->``**`` rewrite,
     # reserved-name escaping, and AST validation below -- they dominate parse
@@ -1480,6 +1550,13 @@ def _safe_eval(expr: str, known: Dict[str, float]) -> Optional[float]:
     if not _validate_ast(expr):
         logger.debug("Rejected unsafe expression: %s", expr)
         return None
+    try:
+        tree = ast.fix_missing_locations(
+            _IntLiteralsToFloat().visit(ast.parse(expr, mode="eval"))
+        )
+        code = compile(tree, "<dynare-expr>", "eval")
+    except (SyntaxError, ValueError, OverflowError):
+        return None
 
     def _cbrt(x):
         x = float(x)
@@ -1509,11 +1586,14 @@ def _safe_eval(expr: str, known: Dict[str, float]) -> Optional[float]:
             return math.nan
         return NormalDist(mu, sigma).inv_cdf(p)
 
-    def _dynare_round(value: float) -> int:
-        """Match Dynare/C++ rounding: halfway values go away from zero."""
+    def _dynare_round(value: float) -> float:
+        """Match Dynare/C++ rounding: halfway values go away from zero.
+
+        Returns a float (as Dynare does) so later ``**`` stays float math.
+        """
         if value >= 0:
-            return math.floor(value + 0.5)
-        return math.ceil(value - 0.5)
+            return float(math.floor(value + 0.5))
+        return float(math.ceil(value - 0.5))
 
     env = {
         "exp": math.exp,
@@ -1539,8 +1619,8 @@ def _safe_eval(expr: str, known: Dict[str, float]) -> Optional[float]:
         "asinh": math.asinh,
         "acosh": math.acosh,
         "atanh": math.atanh,
-        "floor": math.floor,
-        "ceil": math.ceil,
+        "floor": _float_floor,
+        "ceil": _float_ceil,
         "round": _dynare_round,
         "min": min,
         "max": max,
@@ -1564,7 +1644,7 @@ def _safe_eval(expr: str, known: Dict[str, float]) -> Optional[float]:
     )
     env.update({_escape_reserved_identifier(k): v for k, v in known.items()})
     try:
-        return float(eval(expr, {"__builtins__": {}}, env))
+        return float(eval(code, {"__builtins__": {}}, env))
     except (
         NameError,
         ValueError,
@@ -1639,6 +1719,17 @@ def _inside_block(offset: int, ranges: List[Tuple[int, int]]) -> bool:
     return any(s <= offset < e for s, e in ranges)
 
 
+def _inside_open_paren(stripped: str, offset: int) -> bool:
+    """True when ``offset`` sits inside an unclosed ``(`` of its statement.
+
+    A real ``name = expr;`` assignment always starts at statement level;
+    ``name=value`` inside a parenthesised option list is a command option.
+    """
+    stmt_start = stripped.rfind(";", 0, offset) + 1
+    segment = stripped[stmt_start:offset]
+    return segment.count("(") > segment.count(")")
+
+
 def _parse_param_assignments(
     stripped: str,
     text: str,
@@ -1667,6 +1758,11 @@ def _parse_param_assignments(
         if _inside_block(m.start(), block_exclusions):
             continue
         if _inside_block(m.start(), decl_ranges):
+            continue
+        if _inside_open_paren(stripped, m.start()):
+            # Keyword option of a command such as
+            # ``external_function(name=myfun, nargs=1);`` or
+            # ``trend_var(growth_factor=gA) y;`` -- not an assignment.
             continue
 
         expr = m.group(2).strip()
@@ -2153,7 +2249,7 @@ def _looks_like_function_call(source: str, end_offset: int) -> bool:
 
 def _extract_nostrict_implicit_names(source: str) -> List[str]:
     cleaned = _strip_equation_tags_from_text(source)
-    cleaned = _mask_string_literals(cleaned)
+    cleaned = mask_float_literals(_mask_string_literals(cleaned))
     names: List[str] = []
     for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", cleaned):
         name = match.group(1)
@@ -2470,7 +2566,7 @@ _PRIOR_SHAPES = {
 
 def _parse_float_token(tok: str) -> Optional[float]:
     """Parse a numeric estimated_params field, allowing Dynare's inf/-inf."""
-    tok = tok.strip()
+    tok = _D_EXPONENT_LITERAL_RE.sub(r"\1e\2", tok.strip())
     try:
         return float(tok)
     except ValueError:
@@ -2558,7 +2654,9 @@ def _parse_estimation_blocks(stripped: str, text: str, model: "ParsedModel") -> 
         model.estimated_params_range = _range_from_match(text, ep_match)
         body = ep_match.group(2)
         body_offset = ep_match.start(2)
-        for entry_match in re.finditer(r"[^;]+;", body):
+        # Start each entry at its first code character (comments are
+        # already blanked), not right after the previous ``;``.
+        for entry_match in re.finditer(r"[^;\s][^;]*;", body):
             raw = entry_match.group(0)[:-1]
             if not raw.strip():
                 continue

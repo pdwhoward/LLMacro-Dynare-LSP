@@ -191,15 +191,10 @@ class DynareSession:
                 if time.monotonic() >= deadline:
                     break
                 try:
-                    rec = json.loads(out_path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError) as exc:
-                    for p in (mod_path, out_path):
-                        try:
-                            p.unlink()
-                        except OSError:
-                            pass
-                    if job_dir is not None:
-                        shutil.rmtree(job_dir, ignore_errors=True)
+                    rec = mr.load_result_json(out_path)
+                except (OSError, ValueError) as exc:
+                    # ValueError covers JSONDecodeError and UnicodeDecodeError.
+                    self._cleanup_job(jid, mod_path, out_path, job_dir)
                     message = f"Could not parse MATLAB result JSON: {exc}"
                     return {
                         "success": False,
@@ -214,13 +209,7 @@ class DynareSession:
                         "raw_log": self._tail_log(),
                         "message": message,
                     }
-                for p in (mod_path, out_path):
-                    try:
-                        p.unlink()
-                    except OSError:
-                        pass
-                if job_dir is not None:
-                    shutil.rmtree(job_dir, ignore_errors=True)
+                self._cleanup_job(jid, mod_path, out_path, job_dir)
                 return mr._shape_from_record(rec, "")
             if not self._alive():
                 message = "MATLAB session died during the run."
@@ -251,6 +240,40 @@ class DynareSession:
             "raw_log": raw_log,
             "message": message,
         }
+
+    def _cleanup_job(
+        self,
+        jid: str,
+        mod_path: Path,
+        out_path: Path,
+        job_dir: Optional[Path],
+    ) -> None:
+        """Remove one finished job's inputs and Dynare's per-model outputs.
+
+        Dynare writes ``<jid>/``, ``+<jid>/`` and ``<jid>.log`` (plus other
+        ``<jid>*`` files) next to the model; in a long-lived session they
+        would otherwise accumulate for every run.  ``jid`` is a random,
+        session-unique stem, so the glob cannot touch other jobs' files.
+        """
+        for path in (mod_path, out_path):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        if job_dir is not None:
+            shutil.rmtree(job_dir, ignore_errors=True)
+        workdir = self.workdir
+        if workdir is None:
+            return
+        for pattern in (f"{jid}*", f"+{jid}"):
+            for artifact in workdir.glob(pattern):
+                try:
+                    if artifact.is_dir() and not artifact.is_symlink():
+                        shutil.rmtree(artifact, ignore_errors=True)
+                    else:
+                        artifact.unlink()
+                except OSError:
+                    pass
 
     # -- teardown -----------------------------------------------------------
 

@@ -27,6 +27,7 @@ from typing import List, Optional, Set
 from .diagnostics import Diagnostic, Severity
 from .parser import (
     _PRIOR_SHAPES,
+    _parse_float_token,
     _strip_comments,
     EstimatedParam,
     ParsedModel,
@@ -35,6 +36,7 @@ from .parser import (
 )
 
 _FALLBACK_RANGE = SourceRange(Position(0, 0), Position(0, 1))
+_INV_GAMMA_SHAPES = frozenset({"inv_gamma_pdf", "inv_gamma1_pdf", "inv_gamma2_pdf"})
 
 
 def _rng(rng: Optional[SourceRange]) -> SourceRange:
@@ -135,11 +137,7 @@ def _prior_fields(
             j = index + offset
             if j >= len(fields) or not fields[j]:
                 return None
-            try:
-                value = float(fields[j])
-            except ValueError:
-                return None
-            return value
+            return _parse_float_token(fields[j])
         return shape, value_at(1), value_at(2)
     return entry.prior_shape, None, None
 
@@ -155,7 +153,19 @@ def _prior_support_diagnostics(
     shape, prior_mean, prior_std = _prior_fields(model, entry)
     diagnostics: List[Diagnostic] = []
 
-    if prior_std is not None and (not math.isfinite(prior_std) or prior_std <= 0):
+    # Dynare's inverse_gamma_specification.m accepts an infinite prior
+    # variance for inverse-gamma priors (e.g. schorfheide_2000.mod uses
+    # ``stderr e_a, inv_gamma_pdf, 0.035449, inf;``).
+    infinite_std_ok = (
+        shape in _INV_GAMMA_SHAPES
+        and prior_std is not None
+        and prior_std == math.inf
+    )
+    if (
+        prior_std is not None
+        and not infinite_std_ok
+        and (not math.isfinite(prior_std) or prior_std <= 0)
+    ):
         diagnostics.append(Diagnostic(
             range=rng,
             severity=Severity.WARNING,

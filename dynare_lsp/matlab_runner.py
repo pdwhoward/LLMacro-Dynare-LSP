@@ -113,6 +113,23 @@ def _matlab_popen_kwargs() -> Dict[str, Any]:
     return {"start_new_session": True}
 
 
+def load_result_json(path: Path) -> Any:
+    """Parse a MATLAB result file written by ``run_dynare_model.m``.
+
+    ``jsonencode`` output is written through ``fopen`` in MATLAB's default
+    character encoding, which on Windows is often cp1252 rather than UTF-8
+    (e.g. localized Dynare error text).  Decode UTF-8 first and fall back to
+    cp1252 so a non-UTF-8 message yields a verdict instead of escaping as a
+    ``UnicodeDecodeError``.  Raises ``OSError`` or ``ValueError`` only.
+    """
+    data = path.read_bytes()
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = data.decode("cp1252", errors="replace")
+    return json.loads(text)
+
+
 def _kill_process_tree(proc: subprocess.Popen) -> None:
     """Best-effort termination of MATLAB plus descendants after a timeout."""
     if proc.poll() is not None:
@@ -121,6 +138,7 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
         try:
             completed = subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
@@ -233,12 +251,12 @@ def find_dynare(dynare_path: Optional[str] = None) -> Optional[str]:
     if env_path:
         return _resolve_dynare_matlab_dir(env_path)
 
+    from .preprocessor import dynare_versioned_install_roots
+
     candidates: List[str] = []
     if os.name == "nt":
-        candidates.extend(sorted(
-            glob.glob(r"C:\Program Files\dynare\*"),
-            reverse=True,
-        ))
+        # Newest version first, compared numerically (6.10 > 6.9).
+        candidates.extend(dynare_versioned_install_roots(r"C:\Program Files\dynare"))
         candidates.append(_DEFAULT_DYNARE_WINDOWS)
     else:
         system = platform.system()
@@ -247,10 +265,14 @@ def find_dynare(dynare_path: Optional[str] = None) -> Optional[str]:
                 "/usr/share/dynare",
                 "/usr/local/share/dynare",
                 "/usr/lib/dynare",
+                "/usr/lib64/dynare",
                 "/usr/local/lib/dynare",
             ])
-            candidates.extend(sorted(glob.glob("/opt/dynare/*"), reverse=True))
+            candidates.extend(dynare_versioned_install_roots("/opt/dynare"))
         elif system == "Darwin":
+            # The macOS package installs to /Applications/Dynare/<x.y-arch>/
+            # (matlab/ inside); several versions can coexist.
+            candidates.extend(dynare_versioned_install_roots("/Applications/Dynare"))
             candidates.extend([
                 "/Applications/Dynare.app/Contents/Resources/dynare",
                 "/Applications/Dynare.app/Contents/Resources",
@@ -786,8 +808,8 @@ def run_dynare_matlab(
 
         if out_json.exists():
             try:
-                rec = json.loads(out_json.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as exc:
+                rec = load_result_json(out_json)
+            except (OSError, ValueError) as exc:
                 return {
                     "success": False,
                     "matlab_available": True,

@@ -5,16 +5,20 @@ import hashlib
 import json
 import math
 import re
+import os
 import tempfile
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
 from numbers import Integral, Real
 from typing import Any
 
+from .steady_state import DYNARE_SOLVE_TOLF
+
 SCHEMA_VERSION = "dynare-analysis/1"
 STAGES = ("diagnostics", "preprocessor", "steady_state", "residuals", "jacobian", "blanchard_kahn")
 STATUSES = frozenset({"passed", "failed", "not_run", "unsupported", "unavailable"})
-DEFAULT_CONFIG = {"tolerance": 1e-6, "solve_budget": 10.0, "numerical": False, "preprocessor": False, "search_paths": []}
+DEFAULT_CONFIG = {"tolerance": DYNARE_SOLVE_TOLF, "solve_budget": 10.0, "numerical": False, "preprocessor": False, "search_paths": []}
 
 
 def json_safe(value: Any) -> Any:
@@ -85,6 +89,11 @@ class AnalysisSnapshot:
     include_models: dict[str, Any]
     unresolved: list[Any]
     cycles: list[Any]
+    # Normalized snapshot key -> the filename exactly as the caller supplied it.
+    display_names: dict[str, str] = field(default_factory=dict)
+
+    def display_name(self, key: str) -> str:
+        return self.display_names.get(key, key)
 
     @property
     def snapshot_id(self) -> str:
@@ -98,11 +107,14 @@ class AnalysisSnapshot:
 
 
 def snapshot(file_content: str, active_file: str = "model.mod", files: dict[str, str] | None = None,
-             config: dict[str, Any] | None = None) -> AnalysisSnapshot:
+             config: dict[str, Any] | None = None, *,
+             preserve_include_ranges: bool = False) -> AnalysisSnapshot:
     """Freeze supplied buffers; missing includes never silently read local disk.
 
     active_file is the model entrypoint, not an ambiguous include fragment.
     Absolute entrypoints anchor relative map keys to their own directory.
+    Context retrieval can preserve include-local ranges instead of the
+    synthetic expansion-order ranges required by ordinary analysis.
     """
     from .diagnostics import model_with_include_context, _with_model_editing_commands
     from .workspace import WorkspaceIndex, _normalize_uri
@@ -111,29 +123,44 @@ def snapshot(file_content: str, active_file: str = "model.mod", files: dict[str,
     if not isinstance(file_content, str) or not isinstance(active_file, str) or not active_file:
         raise ValueError("file_content and a nonempty active_file are required")
     config = effective_config(config)
-    supplied = _rebase_relative_file_keys(active_file, dict(files or {})) or dict(files or {})
-    normalized: dict[str, str] = {}
-    for filename, content in supplied.items():
+    raw = dict(files or {})
+    for filename, content in raw.items():
         if not isinstance(filename, str) or not isinstance(content, str):
             raise ValueError("files must map filenames to source strings")
+    # Rebase an identity map so every anchored key remembers its caller name.
+    identity = {name: name for name in raw}
+    rebased = _rebase_relative_file_keys(active_file, identity) or identity
+    normalized: dict[str, str] = {}
+    display: dict[str, str] = {}
+    for filename, original in rebased.items():
+        content = raw[original]
         key = _normalize_uri(filename)
         if key in normalized and normalized[key] != content:
-            raise ValueError(f"Conflicting aliases for {filename}")
+            raise ValueError(f"Conflicting aliases for {original}")
         normalized[key] = content
+        display.setdefault(key, original)
     entry = _normalize_uri(active_file)
     normalized[entry] = file_content  # The unsaved active buffer always wins.
+    display[entry] = active_file
 
     class SuppliedIndex(WorkspaceIndex):
+        def _contextualize_include(self, *args, **kwargs):
+            if preserve_include_ranges:
+                kwargs["preserve_ranges"] = True
+            return super()._contextualize_include(*args, **kwargs)
+
         def _read_and_parse_from_disk(self, path):
             return self.get_model(str(path))
 
-        def _resolve_directive(self, including_key, filename, active_search_paths=None):
+        def _resolve_directive(self, including_key, filename, active_search_paths=None,
+                               *, root_key=None, strict=False):
             from .include_resolver import resolve_include_path
             search_paths, known_paths = self._directive_resolution_inputs(
                 including_key, active_search_paths
             )
             return resolve_include_path(
-                filename, including_key, search_paths, known_paths, known_only=True
+                filename, including_key, search_paths, known_paths, known_only=True,
+                working_dir=self._working_dir_for_root(root_key), strict=strict,
             )
 
     paths = [Path(p) if Path(p).is_absolute() else Path(entry).parent / p for p in config["search_paths"]]
@@ -146,47 +173,201 @@ def snapshot(file_content: str, active_file: str = "model.mod", files: dict[str,
         raise ValueError("No parsed model for entrypoint")
     model = _with_model_editing_commands(model_with_include_context(root, list(includes.values()), include_model_equations=True))
     return AnalysisSnapshot(entry, normalized, config, index, root, model, includes,
-                            index.find_unresolved_includes(entry), index.find_circular_includes(entry))
+                            index.find_unresolved_includes(entry), index.find_circular_includes(entry),
+                            display_names=display)
+
+
+_STATIC_INCLUDE = re.compile(r'^([ \t]*@#\s*include\s*)["\']([^"\'\r\n]+)["\'][ \t]*(?=\r?$)', re.MULTILINE)
+_MACRO_DIRECTIVE = re.compile(r"(?:^|(?<=[\r\n]))[ \t]*@#\s*([A-Za-z_]\w*)")
+# NUL and other C0/DEL controls (tab, LF, VT, FF and CR are whitespace) make
+# the bundled preprocessor stall until its timeout; reject them up front.
+_DISALLOWED_CONTROL = re.compile(r"[\x00-\x08\x0e-\x1f\x7f]")
+_UNLOCATED_ERROR = re.compile(r"^\s*ERROR:\s*(.+?)\s*$")
+_SENTINEL_RANGE = ((0, 0), (0, 1))
+
+
+def _macro_scan(content: str) -> str:
+    from .parser import _strip_non_macro_comments
+    scan = _strip_non_macro_comments(content)
+    # Keep offsets stable while recognizing a directive after an initial BOM.
+    return " " + scan[1:] if scan.startswith("\ufeff") else scan
+
+
+def dynamic_macro_io(content: str) -> str | None:
+    """Name the first macro directive whose file IO is not statically known.
+
+    ``@#define``, ``@#if``/``@#ifdef``/``@#ifndef``, ``@#for``, ``@#echo``,
+    ``@#error`` and friends are evaluated in memory by the preprocessor and
+    are safe. Only ``@#includepath`` and ``@#include`` directives whose
+    filename is not a plain string literal (or is macro-expanded with
+    ``@{...}``) can reach files outside the frozen snapshot.
+    """
+    scan = _macro_scan(content)
+    static = {m.start() for m in _STATIC_INCLUDE.finditer(scan) if "@{" not in m.group(2)}
+    for match in _MACRO_DIRECTIVE.finditer(scan):
+        name = match.group(1).lower()
+        if name == "includepath":
+            return "@#includepath"
+        if name == "include" and match.start() not in static:
+            return "macro-expanded @#include"
+    return None
+
+
+def _position(text: str, offset: int) -> tuple[int, int]:
+    line = text.count("\n", 0, offset)
+    return line, offset - (text.rfind("\n", 0, offset) + 1)
+
+
+def _entry_include_anchors(snap: AnalysisSnapshot) -> dict[str, Any]:
+    """Map every reachable include to the entry-file directive that pulls it in."""
+    anchors: dict[str, Any] = {}
+    for directive, resolved, _context in snap.index.resolve_direct_includes(snap.entry_file):
+        if resolved is None:
+            continue
+        pending, seen = [resolved], set()
+        while pending:
+            key = pending.pop()
+            if key in seen:
+                continue
+            seen.add(key)
+            anchors.setdefault(key, directive.range)
+            pending.extend(r for _d, r, _c in snap.index.resolve_direct_includes(key) if r is not None)
+    return anchors
+
+
+def _control_character_result(snap: AnalysisSnapshot, sources: dict[str, str]) -> Any:
+    """Return a failed preprocessor result locating disallowed control chars."""
+    from .diagnostics import Diagnostic, Severity
+    from .parser import Position, SourceRange
+    from .preprocessor import PreprocessorResult
+    anchors = None
+    diagnostics = []
+    for name in [snap.entry_file] + [n for n in sources if n != snap.entry_file]:
+        match = _DISALLOWED_CONTROL.search(sources[name])
+        if match is None:
+            continue
+        line, character = _position(sources[name], match.start())
+        message = (f"Invalid control character U+{ord(match.group()):04X} in source; "
+                   "Dynare cannot preprocess this file.")
+        if name == snap.entry_file:
+            source_range = SourceRange(Position(line, character), Position(line, character + 1))
+        else:
+            anchors = _entry_include_anchors(snap) if anchors is None else anchors
+            message = f"[{snap.display_name(name)}:{line + 1}:{character + 1}] {message}"
+            source_range = anchors.get(name) or SourceRange(Position(0, 0), Position(0, 1))
+        diagnostics.append(Diagnostic(range=source_range, severity=Severity.ERROR, message=message,
+                                      source="dynare-preprocessor", code=f"P{len(diagnostics) + 1:03d}"))
+    if not diagnostics:
+        return None
+    return PreprocessorResult(success=False, diagnostics=diagnostics, raw_output="", preprocessor_path="")
+
+
+def _relabel_preprocessor_output(snap: AnalysisSnapshot, result: Any, folder: str,
+                                 targets: dict[str, Path]) -> None:
+    """Replace private mirror paths with caller names, before reconciliation.
+
+    The preprocessor reports mirror files as absolute or run-directory
+    relative paths with either separator. Findings it could not locate in
+    the entry file are anchored at the entry directive that includes the
+    reported file, so output is deterministic across calls. A rejected run
+    whose only complaint is an unlocated ``ERROR:`` line keeps that line.
+    """
+    from .diagnostics import Diagnostic, Severity
+    from .parser import Position, SourceRange
+    by_target = {target.name.lower(): name for name, target in targets.items()}
+    mirror_path = re.compile(r"(?:[A-Za-z]:)?[^\s\[\]\"'<>|:]*?" + re.escape(Path(folder).name)
+                             + r"[\\/]+(source_\d+\.mod)", re.IGNORECASE)
+    exact = sorted(((form, name) for name, target in targets.items()
+                    for form in {str(target), target.as_posix(), os.path.normcase(str(target))}),
+                   key=lambda item: -len(item[0]))
+    anchors: dict[str, Any] | None = None
+    diagnostics = list(result.diagnostics)
+    if (not result.success and getattr(result, "exit_code", None) not in (None, 0)
+            and all(d.code == "P000" for d in diagnostics)):
+        unlocated = [m.group(1) for line in (getattr(result, "raw_output", "") or "").splitlines()
+                     if (m := _UNLOCATED_ERROR.match(line))]
+        if unlocated:
+            diagnostics = [Diagnostic(range=SourceRange(Position(0, 0), Position(0, 1)),
+                                      severity=Severity.ERROR, message=message,
+                                      source="dynare-preprocessor", code=f"P{i:03d}")
+                           for i, message in enumerate(unlocated, 1)]
+    for diag in diagnostics:
+        mentioned: list[str] = []
+        message = diag.message
+        for form, name in exact:
+            if form in message:
+                message = message.replace(form, snap.display_name(name))
+                mentioned.append(name)
+
+        def replace(match: re.Match[str]) -> str:
+            name = by_target.get(match.group(1).lower())
+            if name is None:
+                return match.group(0)
+            mentioned.append(name)
+            return snap.display_name(name)
+
+        diag.message = mirror_path.sub(replace, message)
+        start, end = diag.range.start, diag.range.end
+        unlocated_range = ((start.line, start.character), (end.line, end.character)) == _SENTINEL_RANGE
+        included = next((name for name in mentioned if name != snap.entry_file), None)
+        if unlocated_range and included is not None:
+            anchors = _entry_include_anchors(snap) if anchors is None else anchors
+            if included in anchors:
+                diag.range = anchors[included]
+    result.diagnostics = diagnostics
 
 
 def _preprocess(snap: AnalysisSnapshot) -> tuple[dict[str, Any], Any]:
     """Preprocess a static supplied include tree in a private temporary mirror.
 
-    Dynamic macro IO is conservatively unsupported: never read a dependency
-    outside the fingerprint. Ordinary native analysis remains available.
+    Macro directives evaluated in memory (``@#define``, ``@#if``, ``@#for``,
+    ...) are supported. Dynamic macro IO (``@#includepath`` or a
+    macro-expanded ``@#include``) is conservatively unsupported: never read a
+    dependency outside the fingerprint. Only supplied files are mirrored and
+    every static include is rewritten to its mirror, so an unsupplied include
+    stays unresolved (E061) instead of being read from disk.
     """
-    from .parser import _strip_non_macro_comments
     from .preprocessor import find_preprocessor
     from . import preprocessor
-    include_re = re.compile(r'^([ \t]*@#\s*include\s*)["\']([^"\'\r\n]+)["\'][ \t]*(?=\r?$)', re.MULTILINE)
-    def macro_scan(content: str) -> str:
-        scan = _strip_non_macro_comments(content)
-        # Keep offsets stable while recognizing a directive after an initial BOM.
-        return " " + scan[1:] if scan.startswith("\ufeff") else scan
-    for content in snap.files.values():
-        scan = macro_scan(content)
-        remaining = include_re.sub("", scan)
-        if re.search(r"(?:^|[\r\n])\s*@#", remaining):
-            return stage("unsupported", reason="Dynamic macro preprocessing requires an explicit external workspace; no untracked dependencies are read."), None
+    # All supplied buffers stay in the snapshot fingerprint, but only the
+    # entry's resolved include closure participates in preprocessing.
+    reachable = {snap.entry_file}
+    reachable.update(
+        name if name in snap.files else name.rsplit("#", 1)[0]
+        for name in snap.include_models
+    )
+    sources = {name: snap.files[name] for name in sorted(reachable)}
+    for name, content in sources.items():
+        dynamic = dynamic_macro_io(content)
+        if dynamic:
+            return stage("unsupported", reason=f"Dynamic macro IO ({dynamic} in {snap.display_name(name)}) "
+                         "requires an explicit external workspace; no untracked dependencies are read."), None
     if snap.unresolved or snap.cycles:
         return stage("not_run", reason="Resolve supplied include dependencies first."), None
+    invalid = _control_character_result(snap, sources)
+    if invalid is not None:
+        return stage("failed", reason="Source contains characters the Dynare preprocessor cannot read.",
+                     executable=None, exit_code=None,
+                     findings=[diagnostic_row(d) for d in invalid.diagnostics]), invalid
     executable = find_preprocessor()
     if not executable:
         return stage("unavailable", reason="Dynare preprocessor not found."), None
     with tempfile.TemporaryDirectory(prefix="dynare_analysis_") as folder:
-        targets = {name: Path(folder) / f"source_{i}.mod" for i, name in enumerate(sorted(snap.files))}
-        for name, content in snap.files.items():
+        targets = {name: Path(folder) / f"source_{i}.mod" for i, name in enumerate(sources)}
+        for name, content in sources.items():
             mappings = {}
             for directive, resolved, _context in snap.index.resolve_direct_includes(name):
                 mappings[directive.filename] = targets.get(resolved)
+
             def rewrite(match):
                 target = mappings.get(match.group(2))
                 if target is None:
                     raise ValueError("Include is not part of the frozen snapshot")
                 return f'{match.group(1)}"{target.as_posix()}"'
+
             # Only replace active include statements, not comments or quoted text.
-            scan = macro_scan(content)
-            edits = [(m.start(), m.end(), rewrite(m)) for m in include_re.finditer(scan)]
+            scan = _macro_scan(content)
+            edits = [(m.start(), m.end(), rewrite(m)) for m in _STATIC_INCLUDE.finditer(scan)]
             for start, end, replacement in reversed(edits):
                 content = content[:start] + replacement + content[end:]
             targets[name].write_text(content, encoding="utf-8", newline="")
@@ -194,26 +375,87 @@ def _preprocess(snap: AnalysisSnapshot) -> tuple[dict[str, Any], Any]:
         # Runtime installation adds the explicit cache-bypass keyword.
         run_preprocessor = getattr(preprocessor, "run_preprocessor")
         result = run_preprocessor(text, executable, source_dir=folder, timeout=30, use_cache=False)
-        unavailable = any(d.code == "P000" for d in result.diagnostics)
-        info = stage("unavailable" if unavailable else "passed" if result.success else "failed",
-                     executable=executable, exit_code=result.exit_code,
-                     findings=[diagnostic_row(d) for d in result.diagnostics])
-        # Temporary paths are implementation details; attach stable source labels.
-        for row in info["findings"]:
-            for original, target in targets.items():
-                row["message"] = row["message"].replace(str(target), original).replace(target.name, original)
-        return info, result
+        # Relabel before reconciliation so no private path reaches any stage.
+        _relabel_preprocessor_output(snap, result, folder, targets)
+    # P000 alone means the preprocessor never produced a verdict (spawn
+    # failure or timeout). A non-zero exit from a run that happened is a
+    # rejection, even when its message could not be located.
+    ran = getattr(result, "exit_code", None) is not None
+    unavailable = not ran and any(d.code == "P000" for d in result.diagnostics)
+    info = stage("unavailable" if unavailable else "passed" if result.success else "failed",
+                 executable=executable, exit_code=getattr(result, "exit_code", None),
+                 findings=[diagnostic_row(d) for d in result.diagnostics])
+    return info, result
+
+
+def bk_skipped(bk: Any) -> bool:
+    """A BK result without a verdict: unsatisfied yet no eigenvalues computed.
+
+    Mirrors bk_check.bk_to_diagnostics (I071), so scipy absence or a failed
+    eigenvalue computation is never reported as a genuine BK violation.
+    """
+    eigenvalues = getattr(bk, "eigenvalues", None)
+    return not bk.satisfied and (eigenvalues is None or len(eigenvalues) == 0)
+
+
+FINDING_LIMITS = {"ERROR": 200, "WARNING": 100}
+OTHER_FINDING_LIMIT = 20
+
+
+def limit_findings(rows: list[dict[str, Any]], limits: dict[str, int] | None = None,
+                   other_limit: int = OTHER_FINDING_LIMIT) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Keep findings in order up to a per-severity cap and summarize the rest."""
+    limits = FINDING_LIMITS if limits is None else limits
+    kept: list[dict[str, Any]] = []
+    counts: Counter[str] = Counter()
+    omitted: Counter[str] = Counter()
+    for row in rows:
+        severity = str(row.get("severity"))
+        counts[severity] += 1
+        if counts[severity] <= limits.get(severity, other_limit):
+            kept.append(row)
+        else:
+            omitted[str(row.get("code") or "")] += 1
+    return kept, {"total": len(rows), "returned": len(kept), "truncated": len(kept) < len(rows),
+                  "by_severity": dict(sorted(counts.items())), "omitted_by_code": dict(sorted(omitted.items())),
+                  "limits": {**limits, "other": other_limit}}
+
+
+def bound_report(report: dict[str, Any]) -> dict[str, Any]:
+    """Cap every stage's findings in place, recording totals and truncation."""
+    for evidence in report.get("stages", {}).values():
+        rows = evidence.get("findings")
+        if isinstance(rows, list):
+            evidence["findings"], evidence["findings_summary"] = limit_findings(rows)
+    return report
+
+
+def unique_endogenous_model(model: Any) -> Any:
+    """Return *model* with repeated endogenous declarations collapsed.
+
+    Dynare only warns about ``var y c; var y;``; the variable is one unknown.
+    A shallow copy keeps the snapshot's parsed model untouched.
+    """
+    import copy
+    seen: set[str] = set()
+    unique = [item for item in model.endogenous if not (item.name in seen or seen.add(item.name))]
+    if len(unique) == len(model.endogenous):
+        return model
+    clone = copy.copy(model)
+    clone.endogenous = unique
+    return clone
 
 
 def numerical_stages(model: Any, tolerance: float, solve_budget: float) -> dict[str, Any]:
     """Required numerical stages fail closed; an empty warning list is not proof."""
+    model = unique_endogenous_model(model)
     output = {name: stage("not_run") for name in STAGES[2:]}
     current = "steady_state"
     try:
         from .solver import compute_steady_state
         steady = compute_steady_state(model, time_budget=solve_budget)
         values = {k: float(v) for k, v in steady.values.items()}
-        valid = steady.success and bool(values) and all(math.isfinite(v) for v in values.values())
+        valid = steady.success and bool(values) and all(math.isfinite(value) for value in values.values())
         output[current] = stage("passed" if valid else "failed", message=steady.message,
                                 values=values if valid else {}, method=getattr(steady, "method_used", None))
         if not valid:
@@ -236,7 +478,7 @@ def numerical_stages(model: Any, tolerance: float, solve_budget: float) -> dict[
         from .model_diagnostics import _static_jacobian_model
         lagged, current_matrix, leading = _compute_jacobian(_static_jacobian_model(model), values)
         matrix = lagged + current_matrix + leading
-        n = len(model.endogenous)
+        n = len({item.name for item in model.endogenous})
         if matrix.shape != (n, n) or n == 0:
             output[current] = stage("unsupported", reason="Static Jacobian is not a nonempty square system.")
             return output
@@ -253,7 +495,7 @@ def numerical_stages(model: Any, tolerance: float, solve_budget: float) -> dict[
         current = "blanchard_kahn"
         from .bk_check import check_blanchard_kahn
         bk = check_blanchard_kahn(model, values)
-        skipped = "check skipped" in (bk.message or "").lower()
+        skipped = bk_skipped(bk)
         output[current] = stage("unsupported" if skipped else "passed" if bk.satisfied else "failed",
                                 satisfied=None if skipped else bool(bk.satisfied), message=bk.message,
                                 n_unstable=bk.n_unstable, n_forward=bk.n_forward,

@@ -86,15 +86,29 @@ def _check_shocks_model(
             _offset_to_position(model.text, block.start()),
             _offset_to_position(model.text, block.end()),
         )
-        for statement in block.group(2).split(";"):
-            text = statement.strip()
-            if not text:
-                continue
+        options = (block.group(1) or "").lower()
+        if re.search(r"(?<!\w)overwrite(?!\w)", options):
+            # ``shocks(overwrite)`` replaces every earlier shocks block, so
+            # an earlier variance/correlation is not a duplicate.
+            seen.clear()
+        statements = [part.strip() for part in block.group(2).split(";")]
+        statements = [part for part in statements if part]
+        for index, text in enumerate(statements):
             lowered = text.lower()
 
             if lowered.startswith("var"):
                 names_part = text[3:].split("=")[0]
                 names = re.findall(r"[A-Za-z_]\w*", names_part)
+                next_statement = (
+                    statements[index + 1].lower() if index + 1 < len(statements) else ""
+                )
+                is_variance = "=" in text or re.match(
+                    r"stderr(?!\w)", next_statement
+                ) is not None
+                if not is_variance:
+                    # Deterministic ``var e; periods ...; values ...;``
+                    # schedules are not variance specifications.
+                    continue
 
                 if len(names) >= 2:
                     # ``var e1, e2 = X`` is a COVARIANCE between two shocks,
