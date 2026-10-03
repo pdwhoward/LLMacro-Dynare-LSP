@@ -2494,8 +2494,57 @@ def _check_steady_state(model: ParsedModel) -> List[Diagnostic]:
                 code="W040",
             )
         )
+        diagnostics.extend(_suspect_steady_state_assignments(model, report))
 
     return diagnostics
+
+
+def _suspect_steady_state_assignments(model: ParsedModel, report) -> List[Diagnostic]:
+    """W043 -- point at the steady-state values shared by every failing equation.
+
+    W041 names the equations that fail at the steady state, but the error is
+    usually one wrong value in ``steady_state_model``.  When at least two
+    equations fail and only one or two assigned variables appear in all of
+    them, those assignments are the likely cause, so each gets a warning on
+    its own line.  A larger or empty overlap does not single out a value and
+    reports nothing.
+    """
+    failing = [
+        r
+        for r in report.results
+        if not r.is_satisfied and not r.is_local_var and r.residual is not None
+    ]
+    if len(failing) < 2:
+        return []
+    assigned = {}
+    for eq in model.steady_state_equations:
+        name = eq.lhs.strip()
+        if re.fullmatch(r"[A-Za-z_]\w*", name):
+            assigned[name] = eq
+    shared = None
+    for result in failing:
+        names = set(re.findall(r"(?<![\w.])[A-Za-z_]\w*", result.equation.text))
+        shared = names if shared is None else shared & names
+    suspects = sorted((shared or set()) & set(assigned))
+    if not 1 <= len(suspects) <= 2:
+        return []
+    # Equation names only: line numbers would make the message (and so the
+    # harness's line-insensitive baseline signature) shift with unrelated edits.
+    names = [f"'{r.equation.name}'" for r in failing if r.equation.name]
+    where = f" ({', '.join(names)})" if len(names) == len(failing) else ""
+    # Sharing a variable is evidence, not proof, so this is a hint.
+    return [
+        Diagnostic(
+            range=assigned[name].range,
+            severity=Severity.INFORMATION,
+            message=(
+                f"'{name}' appears in all {len(failing)} equations that fail at "
+                f"the steady state{where}. Check its steady-state value here."
+            ),
+            code="W043",
+        )
+        for name in suspects
+    ]
 
 
 def _check_ss_block_coverage(model: ParsedModel) -> List[Diagnostic]:
@@ -4737,6 +4786,114 @@ def _check_missing_shocks_block(
 # ---------------------------------------------------------------------------
 
 
+def _unreferenced_endogenous_message(
+    n_eq: int, n_endo: int, unreferenced: List[str]
+) -> str:
+    """E010 text when the surplus variables appear in no model equation.
+
+    The variable may be a stray declaration, or its defining equation may be
+    missing; the text cannot tell which, so it offers both repairs instead of
+    recommending deletion (which silently changes the model when an equation
+    was lost).
+    """
+    names = ", ".join(unreferenced)
+    plural = len(unreferenced) > 1
+    return (
+        f"Equation count mismatch: {n_eq} equation(s) but {n_endo} endogenous "
+        f"variable(s). {names} {'are' if plural else 'is'} declared in 'var' but "
+        f"appear{'' if plural else 's'} in no model equation. Fix: add the "
+        f"equation{'s' if plural else ''} that determine{'' if plural else 's'} "
+        f"{names}, or remove {names} from 'var' if "
+        f"{'they are' if plural else 'it is'} not part of the model."
+    )
+
+
+def _independent_checks_after_structural_error(
+    model: ParsedModel,
+    context_model: ParsedModel,
+    include_symbols: Optional[Dict[str, List[VarDeclaration]]],
+    include_models: Optional[List[ParsedModel]],
+    *,
+    local_lines: List[int],
+    boundary_lines: List[int],
+) -> List[Diagnostic]:
+    """Checks whose blocks do not depend on a structural error elsewhere.
+
+    A structural error makes the model block and everything that reads
+    equations unreliable, so equation counts, references, usage, steady-state
+    and Blanchard-Kahn checks stay off.  Declarations, the ``shocks`` block and
+    parameter assignments are parsed statement by statement; when no
+    structural error falls inside them, their findings are as reliable as on
+    an intact file.
+
+    Two kinds of structural error bound that reliability differently:
+
+    * *local* errors (a missing ``;`` merging two equations or assignments,
+      unbalanced parentheses) stay inside their own block, so only findings in
+      that block (or that read it) are withheld;
+    * *boundary* errors (a missing ``end;``, a misspelled block keyword, a
+      broken macro) can shift where every later block starts and ends, so no
+      finding at or after the first one is reported.
+    """
+    structural_lines = local_lines + boundary_lines
+    if not structural_lines:
+        return []
+    first_error = min(structural_lines)
+    cutoff = min(boundary_lines) if boundary_lines else None
+
+    def _inside(start: int, end: int) -> bool:
+        return any(start <= line <= end for line in structural_lines)
+
+    def _before_cutoff(d: Diagnostic) -> bool:
+        return cutoff is None or d.range.start.line < cutoff
+
+    out: List[Diagnostic] = []
+
+    declarations = model.endogenous + model.exogenous + model.parameters
+    if declarations and max(d.range.end.line for d in declarations) < first_error:
+        out.extend(_check_duplicate_declarations(model, include_symbols))
+
+    # Parameter values feed the shock-value checks too, so a structural error
+    # among the calibration assignments (or past the cutoff) withholds both.
+    assignments = model.param_assignments
+    assignments_reliable = bool(assignments) and not _inside(
+        min(a.range.start.line for a in assignments),
+        max(a.range.end.line for a in assignments),
+    )
+    if assignments and cutoff is not None:
+        assignments_reliable = assignments_reliable and all(
+            a.range.end.line < cutoff for a in assignments
+        )
+    values_reliable = assignments_reliable or not assignments
+
+    shocks_rng = model.shocks_block_range
+    if values_reliable and (
+        shocks_rng is None or not _inside(shocks_rng.start.line, shocks_rng.end.line)
+    ):
+        from .shocks_diagnostics import check_shocks
+
+        out.extend(check_shocks(model, include_models, context_model.param_values()))
+
+    if assignments_reliable:
+        from .usage_diagnostics import _check_nonfinite_params, _usage_text
+
+        out.extend(
+            _check_nonfinite_params(
+                model,
+                _usage_text(model),
+                context_model.parameter_names(),
+                include_models=include_models,
+            )
+        )
+        local_assignment_ranges = {_range_key(a.range) for a in assignments}
+        out.extend(
+            d
+            for d in _check_unevaluable_params(context_model)
+            if _range_key(d.range) in local_assignment_ranges
+        )
+    return [d for d in out if _before_cutoff(d)]
+
+
 def run_diagnostics(
     model: ParsedModel,
     include_symbols: Optional[Dict[str, List[VarDeclaration]]] = None,
@@ -4886,8 +5043,32 @@ def run_diagnostics(
         # E010 (equation count) — suppress: missing end; corrupts equation list.
         # E020 (undeclared refs) — suppress: partial parsing may include
         #   Dynare commands or text outside blocks as equations.
-        # Warnings — suppress all downstream warnings to reduce noise.
-        pass
+        # Warnings — suppress downstream warnings that read the broken region.
+        #
+        # Checks on blocks that parse independently of the broken region still
+        # run, so every error that can be located reliably is reported at once
+        # (owner decision 2026-10-02, DYN-130): duplicate declarations when the
+        # declarations precede every structural error, and shock and parameter
+        # values when their blocks are free of structural errors.
+        diagnostics.extend(
+            _independent_checks_after_structural_error(
+                model,
+                context_model,
+                include_symbols,
+                include_models,
+                local_lines=[
+                    d.range.start.line
+                    for d in (
+                        merged_eq_errors
+                        + merged_assignment_errors
+                        + unbalanced_paren_errors
+                    )
+                ],
+                boundary_lines=[
+                    d.range.start.line for d in (parse_errors + macro_errors)
+                ],
+            )
+        )
     else:
         # No structural errors — run all checks normally
         diagnostics.extend(_check_duplicate_declarations(model, include_symbols))
@@ -5099,23 +5280,15 @@ def run_diagnostics(
                     and len(unreferenced) == 1
                     and not e030_removes_from_var
                 ):
-                    combined_msg = (
-                        f"Equation count mismatch: {n_eq} equation(s) but {n_endo} endogenous "
-                        f"variable(s) ({n_missing} extra variable(s)). "
-                        f"The unreferenced variable(s) {', '.join(unreferenced)} "
-                        f"should be removed from the 'var' declaration. "
-                        f"Fix: remove {', '.join(unreferenced)} from 'var'."
+                    combined_msg = _unreferenced_endogenous_message(
+                        n_eq, n_endo, unreferenced
                     )
-                    combined_fix = _find_name_in_declaration(
-                        model.text, "var", unreferenced[0], model
-                    )
+                    # No automatic edit: deleting the variable is only one of
+                    # two plausible repairs, and it silently changes the model
+                    # when the variable's equation was lost.
                 elif len(unreferenced) == n_missing and not e030_removes_from_var:
-                    combined_msg = (
-                        f"Equation count mismatch: {n_eq} equation(s) but {n_endo} endogenous "
-                        f"variable(s) ({n_missing} extra variable(s)). "
-                        f"The unreferenced variable(s) {', '.join(unreferenced)} "
-                        f"should be removed from the 'var' declaration. "
-                        f"Fix: remove {', '.join(unreferenced)} from 'var'."
+                    combined_msg = _unreferenced_endogenous_message(
+                        n_eq, n_endo, unreferenced
                     )
                 else:
                     combined_msg = (

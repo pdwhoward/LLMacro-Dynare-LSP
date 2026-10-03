@@ -393,6 +393,20 @@ _ENTRIES: Dict[str, Dict[str, str]] = {
             "fills them in automatically when the solver converges."
         ),
     },
+    "W043": {
+        "title": "Steady-state value shared by every failing equation",
+        "body": (
+            "Two or more model equations fail at the steady state, and this "
+            "variable is one of at most two assigned in `steady_state_model` "
+            "that appear in all of them. A single wrong steady-state value is "
+            "the usual cause of this pattern, so this assignment is the first "
+            "place to look.\n\n"
+            "**Fix**\n\n"
+            "Recompute the assigned value from the model's equilibrium "
+            "conditions. The W041 warnings on the failing equations show the "
+            "residuals that a correct value removes."
+        ),
+    },
     "W050": {
         "title": "Undeclared variable in initval",
         "body": (

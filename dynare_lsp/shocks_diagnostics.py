@@ -82,29 +82,42 @@ def _check_shocks_model(
     diagnostics: List[Diagnostic] = []
 
     for block in blocks:
-        anchor = range_override or SourceRange(
-            _offset_to_position(model.text, block.start()),
-            _offset_to_position(model.text, block.end()),
-        )
         options = (block.group(1) or "").lower()
         if re.search(r"(?<!\w)overwrite(?!\w)", options):
             # ``shocks(overwrite)`` replaces every earlier shocks block, so
             # an earlier variance/correlation is not a duplicate.
             seen.clear()
-        statements = [part.strip() for part in block.group(2).split(";")]
-        statements = [part for part in statements if part]
-        for index, text in enumerate(statements):
+        # Keep each statement's offset so a finding is reported on the
+        # statement that causes it, not on the first line of the block.
+        statements: List[Tuple[str, int, int]] = []
+        body_start = block.start(2)
+        # Quote-aware: a ';' inside a string literal does not end a statement.
+        for part in re.finditer(r"""(?:'[^'\n]*'|"[^"\n]*"|[^;'"])+""", block.group(2)):
+            raw = part.group(0)
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            lead = len(raw) - len(raw.lstrip())
+            start = body_start + part.start() + lead
+            statements.append((stripped, start, start + len(stripped)))
+        for index, (text, stmt_start, stmt_end) in enumerate(statements):
+            anchor = range_override or SourceRange(
+                _offset_to_position(model.text, stmt_start),
+                _offset_to_position(model.text, stmt_end),
+            )
             lowered = text.lower()
 
             if lowered.startswith("var"):
                 names_part = text[3:].split("=")[0]
                 names = re.findall(r"[A-Za-z_]\w*", names_part)
                 next_statement = (
-                    statements[index + 1].lower() if index + 1 < len(statements) else ""
+                    statements[index + 1][0].lower()
+                    if index + 1 < len(statements)
+                    else ""
                 )
-                is_variance = "=" in text or re.match(
-                    r"stderr(?!\w)", next_statement
-                ) is not None
+                is_variance = (
+                    "=" in text or re.match(r"stderr(?!\w)", next_statement) is not None
+                )
                 if not is_variance:
                     # Deterministic ``var e; periods ...; values ...;``
                     # schedules are not variance specifications.

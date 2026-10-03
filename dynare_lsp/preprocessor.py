@@ -95,8 +95,10 @@ def _install_version_key(name: str) -> Tuple[Tuple[int, ...], int, str]:
     match = re.match(r"(\d+(?:\.\d+)*)", name)
     version = tuple(int(part) for part in match.group(1).split(".")) if match else ()
     machine = platform.machine().lower()
-    arch_aliases = {"arm64", "aarch64"} if machine in {"arm64", "aarch64"} else {machine}
-    suffix = name[match.end():].lower() if match else name.lower()
+    arch_aliases = (
+        {"arm64", "aarch64"} if machine in {"arm64", "aarch64"} else {machine}
+    )
+    suffix = name[match.end() :].lower() if match else name.lower()
     arch_match = int(any(alias and alias in suffix for alias in arch_aliases))
     return version, arch_match, name
 
@@ -677,7 +679,9 @@ def _byte_range_to_char_range(
             source_lines[start.line] if 0 <= start.line < len(source_lines) else ""
         )
         line_len = len(line_text[:-1] if line_text.endswith("\r") else line_text)
-        end = Position(end.line, min(start.character + 1, max(line_len, start.character)))
+        end = Position(
+            end.line, min(start.character + 1, max(line_len, start.character))
+        )
     return SourceRange(start, end)
 
 
@@ -1416,6 +1420,52 @@ _PREPROCESSOR_AUTHORITATIVE_CODES = frozenset(
 # fail at solve time" signal, not a parser false positive.
 _SURVIVES_PREPROCESSOR_SUCCESS = frozenset({"E010"})
 
+_DECLARED_TWICE = re.compile(r"Symbol\s+(\w+)\s+declared twice", re.IGNORECASE)
+
+
+def _explains_preprocessor_error(
+    own: Diagnostic, preproc_diagnostics: List[Diagnostic]
+) -> bool:
+    """Whether one of our structural ERRORs locates a rejection more precisely.
+
+    Dynare reports a syntax error where its parser gives up, which can be far
+    below the cause: a missing ``end;`` surfaces at the next block, a
+    misspelled ``model`` at the first equation, a missing ``;`` at the next
+    statement.  Our parser names the cause and its line, so when Dynare has
+    also rejected the file we keep that finding:
+
+    * E001 (structural) at or before the first preprocessor error line --
+      the cause of a parse error never comes after the place it is noticed;
+    * E030 (duplicate declaration) for the symbol Dynare reports as
+      "declared twice" -- Dynare points at the first declaration, ours at the
+      duplicate that has to go.
+    """
+    if own.severity != Severity.ERROR:
+        return False
+    errors = [
+        d
+        for d in preproc_diagnostics
+        if d.code not in ("P000", "") and d.severity == Severity.ERROR
+    ]
+    if not errors:
+        return False
+    if own.code == "E001":
+        # Only a parse failure can be caused by an earlier structural fault;
+        # a semantic rejection ("Unknown symbol ...") does not corroborate it.
+        syntax = [d for d in errors if "syntax error" in d.message.lower()]
+        if not syntax:
+            return False
+        first_line = min(d.range.start.line for d in syntax)
+        return own.range.start.line <= first_line
+    if own.code == "E030":
+        duplicated = {
+            m.group(1)
+            for d in errors
+            if (m := _DECLARED_TWICE.search(d.message)) is not None
+        }
+        return any(f"'{name}'" in own.message for name in duplicated)
+    return False
+
 
 def reconcile_diagnostics(
     own_diagnostics: List[Diagnostic],
@@ -1449,9 +1499,15 @@ def reconcile_diagnostics(
             if d.severity != Severity.ERROR or d.code in _SURVIVES_PREPROCESSOR_SUCCESS
         ]
     elif any(d.code != "P000" for d in preproc_result.diagnostics):
-        # The preprocessor genuinely REJECTED the model and produced precise
-        # parse/declaration errors -> defer to it for the structural classes.
-        kept = [
+        # The preprocessor genuinely REJECTED the model -> defer to it for the
+        # structural classes, except where our own finding explains its error
+        # more precisely (see _explains_preprocessor_error).  Those go first.
+        explaining = [
+            d
+            for d in own_diagnostics
+            if _explains_preprocessor_error(d, preproc_result.diagnostics)
+        ]
+        kept = explaining + [
             d
             for d in own_diagnostics
             if d.code not in _PREPROCESSOR_AUTHORITATIVE_CODES

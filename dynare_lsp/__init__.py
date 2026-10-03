@@ -17,7 +17,7 @@ from pkgutil import iter_modules
 from types import ModuleType
 from typing import Optional, Sequence
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 _TARGETS = {
     f"{__name__}.server",

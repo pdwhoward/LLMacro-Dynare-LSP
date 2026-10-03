@@ -101,7 +101,7 @@ exits non-zero. Ordinary warning diagnostics remain non-blocking.
 Install the bundled extension from `vscode-dynare/`:
 
 1. In VS Code, open the Command Palette → **Extensions: Install from VSIX…**
-2. Select `vscode-dynare/dynare-lsp-0.5.0.vsix`.
+2. Select `vscode-dynare/dynare-lsp-0.5.1.vsix`.
 
 The extension launches the Python language server and registers the Dynare
 MCP server for VS Code agents, so install the package with the `all` extra

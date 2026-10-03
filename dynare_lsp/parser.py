@@ -3254,6 +3254,10 @@ def _detect_keyword_typos(
     for m in re.finditer(r"^\s*([A-Za-z]{3,12})\b", stripped, re.MULTILINE):
         if _inside_block(m.start(), block_exclusions):
             continue
+        # ``paramters = 1;`` is a valid top-level assignment, not a keyword;
+        # no block or declaration keyword is ever followed by ``=``.
+        if re.match(r"\s*=(?!=)", stripped[m.end(1) :]):
+            continue
         word = m.group(1).lower()
         correct = _KEYWORD_TYPO_MAP.get(word)
         if correct and correct in check_keywords:

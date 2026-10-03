@@ -114,7 +114,7 @@ if TYPE_CHECKING:
 
 server = LanguageServer(
     "dynare-language-server",
-    "v0.5.0",
+    "v0.5.1",
     text_document_sync_kind=lsp.TextDocumentSyncKind.Full,
 )
 # pygls must split document lines on CR/LF only, exactly like the client and

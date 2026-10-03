@@ -10,7 +10,7 @@ except FileNotFoundError:
 
 setup(
     name="dynare-lsp",
-    version="0.5.0",
+    version="0.5.1",
     description="Language Server Protocol implementation for the Dynare modeling language",
     long_description=long_description,
     long_description_content_type="text/markdown",

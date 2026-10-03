@@ -4,6 +4,49 @@ All notable user-facing changes to the Dynare LSP (Python package, VS Code
 extension, and Claude Code plugin) are recorded here. Versions follow the
 shared package/extension/plugin version.
 
+## 0.5.1 - 2026-10
+
+Diagnostics now point at the cause of an error and report every error that
+can be located reliably. No configuration or API changes.
+
+### Changed
+
+- **Syntax errors are reported at their cause.** When Dynare's preprocessor
+  rejects a file, it reports the line where its parser stops, which can be far
+  below the mistake: a missing `end;` surfaces at the next block, a misspelled
+  `model` keyword at the first equation, a missing `;` at the next statement.
+  The server now keeps its own diagnosis at the line of the cause (for
+  example "Missing 'end;' for 'model' block ... add 'end;' before 'shocks;'")
+  alongside Dynare's message. A variable declared twice is reported on the
+  duplicate declaration, with a fix to remove it.
+- **Independent errors are reported past a syntax error.** Previously any
+  syntax error hid every other check. Errors in blocks the syntax error cannot
+  affect, such as an invalid shock correlation, a negative shock variance, or
+  a non-finite parameter, are now reported at the same time. Checks that read
+  the broken block (equation counts, undeclared references, steady state,
+  Blanchard-Kahn) still wait until the syntax error is fixed; a missing `end;`
+  or a misspelled block keyword withholds every finding after it.
+- **Shock warnings sit on their own statement.** W110, W111, and W112 now
+  point at the offending `var`, `stderr`, or `corr` statement rather than the
+  first line of the `shocks` block.
+- **E010 no longer recommends deleting a variable.** When an endogenous
+  variable appears in no model equation, the message offers both repairs: add
+  the equation that determines it, or remove it from `var` if it is not part
+  of the model. The automatic quick fix that deleted the variable is gone.
+
+### Added
+
+- **W043 steady-state hint.** When at least two equations fail at the steady
+  state and only one or two `steady_state_model` assignments appear in all of
+  them, the server adds an informational hint on those assignment lines.
+
+### Fixed
+
+- A valid top-level assignment such as `paramters = 1;` is no longer
+  reported as a misspelled `parameters` keyword.
+- A semicolon inside a quoted string in a `shocks` block no longer splits the
+  statement.
+
 ## 0.5.0 - 2026-09
 
 This release contains breaking changes to the MCP server surface and the
